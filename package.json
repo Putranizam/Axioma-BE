@@ -1,0 +1,45 @@
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "description": "Axioma AI SaaS Express & TypeScript Backend",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "cleanup-chats": "tsx scripts/cleanup-chats.ts",
+    "cleanup-chats:apply": "tsx scripts/cleanup-chats.ts --apply",
+    "test:auth": "tsx scripts/test-auth-ownership.ts",
+    "test:attachments": "tsx scripts/test-attachments.ts",
+    "test:attachments:full": "tsx scripts/test-attachments-full.ts",
+    "test:undo": "tsx scripts/test-undo-delete.ts",
+    "test:cloudflare": "tsx scripts/test-cloudflare-features.ts",
+    "verify:rls": "tsx scripts/verify-rls.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "@supabase/supabase-js": "^2.118.0",
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.9",
+    "express": "^5.3.0",
+    "helmet": "^8.3.0",
+    "multer": "^2.5.0",
+    "pdf-lib": "^1.17.1"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/multer": "^2.3.0",
+    "@types/node": "^26.6.6",
+    "@types/supertest": "^7.2.1",
+    "nodemon": "^3.1.14",
+    "supertest": "^7.3.2",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}

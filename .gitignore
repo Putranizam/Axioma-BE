@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+.env.*
+.env.local
+!.env.example
+scripts/*.json
+*backup*.json
+*-backup.json
+test-*.json
+*.log
+coverage/
