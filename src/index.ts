@@ -185,12 +185,31 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 });
 
 // 1. Server Setup: Strict CORS allowlist (#4) & JSON body parsing with 1mb limit (#9)
-const configuredOrigins = (process.env.ALLOWED_ORIGINS || "")
+const rawConfiguredOrigins = [
+  process.env.ALLOWED_ORIGINS,
+  process.env.FRONTEND_URL,
+  process.env.NEXT_PUBLIC_APP_URL,
+]
+  .filter(Boolean)
+  .join(",");
+
+const configuredOrigins = rawConfiguredOrigins
   .split(",")
   .map((o) => o.trim().replace(/\/+$/, ""))
   .filter(Boolean);
 
-const allowedOrigins = new Set<string>(configuredOrigins);
+// Origin resmi frontend produksi (Vercel & domain kustom)
+const defaultProductionOrigins = [
+  "https://axioma-fe.vercel.app",
+  "https://axioma.id",
+  "https://www.axioma.id",
+];
+
+const allowedOrigins = new Set<string>([
+  ...defaultProductionOrigins,
+  ...configuredOrigins,
+]);
+
 if (!IS_PRODUCTION) {
   allowedOrigins.add("http://localhost:3000");
   allowedOrigins.add("http://127.0.0.1:3000");
