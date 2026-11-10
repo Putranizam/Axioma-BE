@@ -23,6 +23,15 @@ import {
   MAX_PDF_PAGES,
   SIGNED_URL_TTL_SECONDS,
 } from "./attachments";
+import { transcribeAudio, synthesizeSpeech } from "./voice";
+import {
+  getModelChain,
+  isRetryableGeminiError,
+  isQuotaOrRateLimitError,
+  isZeroQuotaError,
+  modelCooldownUntil,
+  COOLDOWN_DURATIONS,
+} from "./geminiModels";
 
 const app = express();
 const PORT = process.env.PORT || 8000;
@@ -200,6 +209,8 @@ const configuredOrigins = rawConfiguredOrigins
 
 // Origin resmi frontend produksi (Vercel & domain kustom)
 const defaultProductionOrigins = [
+  "https://axioma.my.id",
+  "https://www.axioma.my.id",
   "https://axioma-fe.vercel.app",
   "https://axioma.id",
   "https://www.axioma.id",
@@ -343,13 +354,7 @@ export const AGENT_PROFILES: Record<AgentId, AgentProfile> = {
     id: "axioma-pro",
     label: "Axioma Pro",
     shortName: "Axioma Pro",
-    modelChain: [
-      "gemini-flash-lite-latest",
-      "gemini-3.1-flash-lite",
-      "gemini-3.5-flash-lite",
-      "gemini-3-flash-preview",
-      "gemini-3.8-flash",
-    ],
+    modelChain: getModelChain(),
     temperature: 0.4,
     systemInstruction:
       "Kamu adalah Axioma Pro, asisten AI analitis tingkat lanjut untuk penalaran mendalam, pemecahan masalah kompleks, dan pengambilan keputusan strategis. Kamu HARUS SELALU menjawab menggunakan Bahasa Indonesia yang profesional dan tajam, apa pun bahasa yang digunakan oleh pengguna. ATURAN PRIORITAS UTAMA: Selalu patuhi instruksi panjang, keringkasan, atau format yang diminta pengguna secara eksplisit (misalnya jika pengguna meminta 'jawab singkat', '1 kalimat saja', 'langsung intinya', atau 'tanpa poin/heading', berikan jawaban yang benar-benar singkat dan langsung tanpa heading atau uraian panjang). Hanya jika pengguna tidak membatasi panjang jawaban, uraikan analisis secara sistematis dan gunakan format Markdown seperlunya.",
@@ -358,13 +363,7 @@ export const AGENT_PROFILES: Record<AgentId, AgentProfile> = {
     id: "axioma-omni",
     label: "Axioma Omni",
     shortName: "Axioma Omni",
-    modelChain: [
-      "gemini-flash-lite-latest",
-      "gemini-3.1-flash-lite",
-      "gemini-3.5-flash-lite",
-      "gemini-3-flash-preview",
-      "gemini-3.8-flash",
-    ],
+    modelChain: getModelChain(),
     temperature: 0.7,
     systemInstruction:
       "Kamu adalah Axioma Omni, asisten AI serbaguna yang cepat, adaptif, dan komunikatif untuk kebutuhan harian, penulisan, ringkasan, dan eksplorasi ide. Kamu HARUS SELALU menjawab menggunakan Bahasa Indonesia yang ramah, lugas, natural, dan langsung ke inti permasalahan, apa pun bahasa yang digunakan oleh pengguna. Selalu ikuti permintaan panjang atau format dari pengguna (seperti menjawab singkat jika diminta). Gunakan format Markdown secukupnya agar jawaban ringkas dan nyaman dibaca.",
@@ -373,13 +372,7 @@ export const AGENT_PROFILES: Record<AgentId, AgentProfile> = {
     id: "axioma-architect",
     label: "Axioma Architect",
     shortName: "Axioma Architect",
-    modelChain: [
-      "gemini-flash-lite-latest",
-      "gemini-3.1-flash-lite",
-      "gemini-3.5-flash-lite",
-      "gemini-3-flash-preview",
-      "gemini-3.8-flash",
-    ],
+    modelChain: getModelChain(),
     temperature: 0.2,
     systemInstruction:
       "Kamu adalah Axioma Architect, principal software engineer dan arsitek sistem AI. Kamu HARUS SELALU menjawab menggunakan Bahasa Indonesia yang teknis, presisi, dan rapi, apa pun bahasa yang digunakan oleh pengguna. Selalu patuhi batasan panjang atau format yang diminta pengguna (jika diminta jawaban singkat, jawab secara ringkas dan padat). Saat diminta membuat kode atau merancang sistem: tulis kode yang bersih, modular, type-safe, dan siap produksi (lengkap dengan penanganan error), jelaskan arsitektur secara singkat, dan gunakan blok kode Markdown dengan penanda bahasa yang tepat.",
@@ -394,9 +387,15 @@ export function resolveAgentProfile(rawAgentId?: string): AgentProfile {
   return AGENT_PROFILES["axioma-pro"];
 }
 
-function getModelInstance(modelName: string, profile: AgentProfile) {
+function getModelInstance(
+  modelName: string,
+  profile: AgentProfile,
+  extraInstruction?: string
+) {
   const isThinkingCapable =
-    modelName === "gemini-3-flash-preview" || modelName.startsWith("gemini-2.5");
+    modelName === "gemini-3-flash-preview" ||
+    modelName.includes("preview") ||
+    modelName.includes("thinking");
   const generationConfig: Record<string, any> = {
     temperature: profile.temperature,
   };
@@ -405,9 +404,12 @@ function getModelInstance(modelName: string, profile: AgentProfile) {
   if (isThinkingCapable) {
     generationConfig.thinkingConfig = { thinkingBudget: 0 };
   }
+  const systemInstruction = extraInstruction
+    ? `${profile.systemInstruction}\n\n${extraInstruction}`
+    : profile.systemInstruction;
   return genAI.getGenerativeModel({
     model: modelName,
-    systemInstruction: profile.systemInstruction,
+    systemInstruction,
     generationConfig,
   });
 }
@@ -447,8 +449,6 @@ const DEFAULT_CHAT_TITLE = "New Chat";
 const CHAT_TITLE_MAX_LENGTH = 40;
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-// Cooldown cache for models that recently hit 429 quota/rate-limit or timed out (#7)
-const modelCooldownUntil = new Map<string, number>();
 
 // Sliding-window rate limiters: enforced per User ID AND per Client IP (#3)
 const userRateWindowMap = new Map<string, number[]>();
@@ -575,7 +575,7 @@ async function verifyTurnstileUser(
     if (!response.ok) {
       return {
         success: false,
-        code: "turnstile_verification_failed",
+        code: "turnstile_failed",
         error: "Layanan verifikasi keamanan sedang mengalami gangguan. Silakan coba beberapa saat lagi.",
       };
     }
@@ -912,6 +912,7 @@ interface SendMessageRequest {
   regenerate?: boolean;
   turnstile_token?: string;
   attachment_ids?: string[];
+  voice_mode?: boolean;
 }
 
 interface ApiResponse<T = any> {
@@ -1012,30 +1013,6 @@ export function makeChatTitle(text: string): string {
   return `${(lastSpace > CHAT_TITLE_MAX_LENGTH / 2 ? cut.slice(0, lastSpace) : cut).trimEnd()}…`;
 }
 
-function isRetryableGeminiError(err: any): boolean {
-  const status = typeof err?.status === "number" ? err.status : undefined;
-  if (status !== undefined) return [404, 429, 500, 502, 503, 504].includes(status);
-  const message = String(err?.message || "").toLowerCase();
-  return [
-    "fetch failed",
-    "econnreset",
-    "etimedout",
-    "socket hang up",
-    "network",
-    "aborted",
-    "high demand",
-    "overloaded",
-    "quota",
-    "503",
-    "429",
-  ].some((s) => message.includes(s));
-}
-
-function isQuotaOrRateLimitError(err: any): boolean {
-  if (err?.status === 429) return true;
-  const msg = String(err?.message || "").toLowerCase();
-  return msg.includes("429") || msg.includes("exceeded your current quota") || msg.includes("too many requests");
-}
 
 /**
  * Resolves the calling user strictly (#1):
@@ -1204,7 +1181,13 @@ export function buildNormalizedGeminiContents(
 
 export interface AiAttemptLog {
   model: string;
-  status: "ok" | "429_quota" | "first_chunk_timeout" | "stream_idle_timeout" | "error";
+  status:
+    | "ok"
+    | "429_quota"
+    | "first_chunk_timeout"
+    | "stream_idle_timeout"
+    | "404_not_found"
+    | "error";
   elapsed_ms: number;
   first_chunk_ms?: number;
 }
@@ -1220,7 +1203,8 @@ async function generateWithFallbackAndRetry(
   parentSignal: AbortSignal,
   log: Logger,
   agentProfile: AgentProfile,
-  onChunk?: (chunkText: string) => void
+  onChunk?: (chunkText: string) => void,
+  extraInstruction?: string
 ): Promise<{
   text: string;
   modelUsed: string;
@@ -1329,7 +1313,7 @@ async function generateWithFallbackAndRetry(
     );
 
     try {
-      const modelInstance = getModelInstance(modelName, agentProfile);
+      const modelInstance = getModelInstance(modelName, agentProfile, extraInstruction);
 
       const runAttempt = async (): Promise<{
         text: string;
@@ -1433,14 +1417,28 @@ async function generateWithFallbackAndRetry(
       const errMsgLower = String(err?.message || "").toLowerCase();
       const isZeroQuota = errMsgLower.includes("limit: 0") || errMsgLower.includes("perday");
 
-      if (isZeroQuota) {
-        modelCooldownUntil.set(modelName, Date.now() + MODEL_ZERO_QUOTA_COOLDOWN_MS);
-      } else if (timeoutPhase === "first_chunk" || isQuotaOrRateLimitError(err)) {
-        modelCooldownUntil.set(modelName, Date.now() + MODEL_QUOTA_COOLDOWN_MS);
+      const is404NotFound =
+        err?.status === 404 ||
+        errMsgLower.includes("404") ||
+        errMsgLower.includes("not found") ||
+        errMsgLower.includes("deprecated");
+
+      if (is404NotFound) {
+        modelCooldownUntil.set(modelName, Date.now() + COOLDOWN_DURATIONS.NOT_FOUND_404);
+      } else if (isZeroQuota || isZeroQuotaError(err)) {
+        modelCooldownUntil.set(modelName, Date.now() + COOLDOWN_DURATIONS.DAILY_QUOTA_ZERO);
+      } else if (timeoutPhase === "first_chunk" || timeoutPhase === "chunk_idle") {
+        modelCooldownUntil.set(modelName, Date.now() + COOLDOWN_DURATIONS.TIMEOUT);
+      } else if (isQuotaOrRateLimitError(err)) {
+        modelCooldownUntil.set(modelName, Date.now() + COOLDOWN_DURATIONS.QUOTA_429);
+      } else {
+        modelCooldownUntil.set(modelName, Date.now() + COOLDOWN_DURATIONS.SERVER_ERROR_5XX);
       }
 
       const statusLabel: AiAttemptLog["status"] =
-        timeoutPhase === "first_chunk"
+        is404NotFound
+          ? "404_not_found"
+          : timeoutPhase === "first_chunk"
           ? "first_chunk_timeout"
           : timeoutPhase === "chunk_idle"
           ? "stream_idle_timeout"
@@ -1639,7 +1637,10 @@ const handleHealthCheck = async (req: Request, res: Response) => {
 };
 
 app.get("/health", handleHealthCheck);
-app.get("/api/health", handleHealthCheck);
+// Lightweight warmup endpoint: returns { ok: true } instantly without DB access (#1)
+app.get("/api/health", (_req: Request, res: Response) => {
+  return res.status(200).json({ ok: true });
+});
 
 // 6a. List User's Chats: GET /api/chats (#2, #3)
 app.get("/api/chats", async (req: Request, res: Response) => {
@@ -2266,6 +2267,304 @@ app.get(
   }
 );
 
+// Voice upload multer instance for audio processing (max 10 MB)
+const voiceUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10 MB max audio file
+  },
+});
+
+const handleVoiceUpload = (req: Request, res: Response, next: NextFunction) => {
+  voiceUpload.single("file")(req, res, (err: any) => {
+    if (err) {
+      if (err.code === "LIMIT_FILE_SIZE") {
+        return res.status(413).json({
+          success: false,
+          code: "file_too_large",
+          error: "Ukuran audio melebihi batas 10 MB.",
+        });
+      }
+      return res.status(400).json({
+        success: false,
+        code: "invalid_upload",
+        error: "Gagal mengunggah berkas audio.",
+      });
+    }
+    next();
+  });
+};
+
+const voiceRateWindowMap = new Map<string, number[]>();
+
+function checkVoiceRateLimits(
+  userId: string,
+  clientIp: string,
+  type: "transcribe" | "speak",
+  maxPerMinute: number
+): {
+  allowed: boolean;
+  limitedBy?: "user" | "ip";
+  limit: number;
+  retryAfterSec: number;
+} {
+  const ipKey = `ip:voice:${type}:${clientIp || "unknown"}`;
+  const userKey = `usr:voice:${type}:${userId}`;
+
+  // Pre-check IP window
+  const ipCheck = evaluateSlidingWindow(voiceRateWindowMap, ipKey, maxPerMinute, false);
+  if (!ipCheck.allowed) {
+    return {
+      allowed: false,
+      limitedBy: "ip",
+      limit: maxPerMinute,
+      retryAfterSec: ipCheck.retryAfterSec,
+    };
+  }
+
+  // Check and consume user window
+  const userCheck = evaluateSlidingWindow(voiceRateWindowMap, userKey, maxPerMinute, true);
+  if (!userCheck.allowed) {
+    return {
+      allowed: false,
+      limitedBy: "user",
+      limit: maxPerMinute,
+      retryAfterSec: userCheck.retryAfterSec,
+    };
+  }
+
+  // Consume IP window
+  evaluateSlidingWindow(voiceRateWindowMap, ipKey, maxPerMinute, true);
+
+  return {
+    allowed: true,
+    limit: maxPerMinute,
+    retryAfterSec: 0,
+  };
+}
+
+/**
+ * Shared security authentication and Turnstile validation for Voice Endpoints.
+ * Mirrors the security standards of /api/chats/message.
+ * In development (NODE_ENV !== "production"), testing is supported via header X-Dev-Bypass: true.
+ */
+async function authenticateVoiceRequest(
+  req: Request,
+  res: Response,
+  log: Logger,
+  clientIp: string
+): Promise<{ user: ResolvedUser } | null> {
+  const isDev = process.env.NODE_ENV !== "production";
+  const hasDevBypass =
+    isDev &&
+    (req.headers["x-dev-bypass"] === "true" ||
+      req.headers.authorization === "Bearer dev-bypass");
+
+  if (hasDevBypass) {
+    log.info("[Voice Auth] Development bypass enabled via X-Dev-Bypass header");
+    return {
+      user: {
+        id: (req.headers["x-user-id"] as string)?.trim() || "dev-bypass-user",
+        authenticated: false,
+      },
+    };
+  }
+
+  // 1. Authenticate user
+  const { user, authError } = await resolveRequestUser(req, log);
+  if (authError || !user) {
+    res.status(401).json({
+      success: false,
+      code: "unauthorized",
+      error: authError || "Autentikasi diperlukan.",
+    });
+    return null;
+  }
+
+  // 2. Cloudflare Turnstile anti-bot verification
+  const turnstileToken =
+    (req.headers["x-turnstile-token"] as string) ||
+    (req.headers["cf-turnstile-token"] as string) ||
+    (req.body?.turnstile_token as string);
+
+  const turnstileStatus = await verifyTurnstileUser(
+    user.id,
+    clientIp,
+    turnstileToken
+  );
+  if (!turnstileStatus.success) {
+    const statusCode =
+      turnstileStatus.code === "turnstile_network_error" ? 503 : 403;
+    res.status(statusCode).json({
+      success: false,
+      code: turnstileStatus.code || "turnstile_failed",
+      error: turnstileStatus.error || "Verifikasi keamanan Turnstile gagal.",
+    });
+    return null;
+  }
+
+  return { user };
+}
+
+// Voice Endpoint 1: POST /api/voice/transcribe (Speech-To-Text)
+app.post(
+  "/api/voice/transcribe",
+  handleVoiceUpload,
+  async (req: Request, res: Response) => {
+    const requestId = randomUUID().slice(0, 8);
+    const log = createLogger(requestId);
+    const clientIp = getClientIp(req);
+
+    // Apply shared authentication & Turnstile middleware
+    const auth = await authenticateVoiceRequest(req, res, log, clientIp);
+    if (!auth) return;
+    const { user } = auth;
+
+    // Sliding-window rate limiting per user ID & client IP (30 req/min)
+    const rate = checkVoiceRateLimits(user.id, clientIp, "transcribe", 30);
+    if (!rate.allowed) {
+      return res.status(429).json({
+        success: false,
+        code: "rate_limit_exceeded",
+        error: `Terlalu banyak permintaan suara (maksimal 30 per menit). Silakan tunggu ${rate.retryAfterSec} detik.`,
+      });
+    }
+
+    const file = req.file;
+    if (!file || !file.buffer || file.buffer.length === 0) {
+      return res.status(400).json({
+        success: false,
+        code: "file_required",
+        error: "Berkas audio diperlukan untuk transkripsi.",
+      });
+    }
+
+    if (file.buffer.length > 10 * 1024 * 1024) {
+      return res.status(413).json({
+        success: false,
+        code: "file_too_large",
+        error: "Ukuran audio melebihi batas 10 MB.",
+      });
+    }
+
+    try {
+      const text = await transcribeAudio(
+        file.buffer,
+        file.mimetype || "audio/webm",
+        file.originalname || "recording.webm"
+      );
+      log.info(`Voice transcription completed (${text.length} chars)`);
+      return res.status(200).json({
+        success: true,
+        text,
+      });
+    } catch (err: any) {
+      log.error("Voice transcription error", err);
+      reportCentralizedError(err, {
+        route: "/api/voice/transcribe",
+        userId: user?.id,
+        ip: clientIp,
+      });
+
+      const status = typeof err?.status === "number" ? err.status : undefined;
+      const msg = String(err?.message || "").toLowerCase();
+      const isInvalidAudio =
+        status === 400 ||
+        status === 422 ||
+        msg.includes("invalid") ||
+        msg.includes("unsupported") ||
+        msg.includes("corrupt") ||
+        msg.includes("could not decode");
+
+      if (isInvalidAudio) {
+        return res.status(422).json({
+          success: false,
+          code: "invalid_audio",
+          error: "Audio tidak dapat diproses",
+        });
+      }
+
+      return res.status(502).json({
+        success: false,
+        code: "transcribe_failed",
+        error: "Layanan suara sedang sibuk",
+      });
+    }
+  }
+);
+
+// Voice Endpoint 2: POST /api/voice/speak (Text-To-Speech)
+app.post(
+  "/api/voice/speak",
+  express.json({ limit: "100kb" }),
+  async (req: Request, res: Response) => {
+    const requestId = randomUUID().slice(0, 8);
+    const log = createLogger(requestId);
+    const clientIp = getClientIp(req);
+
+    // Apply shared authentication & Turnstile middleware
+    const auth = await authenticateVoiceRequest(req, res, log, clientIp);
+    if (!auth) return;
+    const { user } = auth;
+
+    // Sliding-window rate limiting per user ID & client IP (30 req/min)
+    const rate = checkVoiceRateLimits(user.id, clientIp, "speak", 30);
+    if (!rate.allowed) {
+      return res.status(429).json({
+        success: false,
+        code: "rate_limit_exceeded",
+        error: `Terlalu banyak permintaan sintesis suara (maksimal 30 per menit). Silakan tunggu ${rate.retryAfterSec} detik.`,
+      });
+    }
+
+    const { text, voice, language } = req.body || {};
+    if (!text || typeof text !== "string" || !text.trim()) {
+      return res.status(400).json({
+        success: false,
+        code: "text_required",
+        error: "Teks yang akan disuarakan diperlukan.",
+      });
+    }
+
+    // Enforce max 1000 characters limit for TTS
+    if (text.length > 1000) {
+      return res.status(400).json({
+        success: false,
+        code: "text_too_long",
+        error: "Teks terlalu panjang (maksimal 1000 karakter).",
+      });
+    }
+
+    try {
+      const audioBuffer = await synthesizeSpeech(text, voice, language);
+      if (!audioBuffer || audioBuffer.length === 0) {
+        return res.status(400).json({
+          success: false,
+          code: "empty_audio",
+          error: "Teks tidak menghasilkan audio.",
+        });
+      }
+
+      res.setHeader("Content-Type", "audio/mpeg");
+      res.setHeader("Cache-Control", "public, max-age=86400, stale-while-revalidate=3600");
+      res.setHeader("Content-Length", String(audioBuffer.length));
+      return res.status(200).send(audioBuffer);
+    } catch (err: any) {
+      log.error("TTS speak error", err);
+      reportCentralizedError(err, {
+        route: "/api/voice/speak",
+        userId: user?.id,
+        ip: clientIp,
+      });
+      return res.status(502).json({
+        success: false,
+        code: "speak_failed",
+        error: "Layanan suara sedang sibuk",
+      });
+    }
+  }
+);
+
 // Track in-flight streaming requests per chat so DELETE /api/chats/:id can abort background streams immediately (#2)
 const activeChatStreams = new Map<string, AbortController>();
 
@@ -2400,10 +2699,14 @@ app.post(
       }
 
       // 2b. Cloudflare Turnstile anti-bot verification (#9)
+      const turnstileToken =
+        (req.body?.turnstile_token as string) ||
+        (req.headers["x-turnstile-token"] as string) ||
+        (req.headers["cf-turnstile-token"] as string);
       const turnstileStatus = await verifyTurnstileUser(
         user.id,
         clientIp,
-        req.body?.turnstile_token
+        turnstileToken
       );
       if (!turnstileStatus.success) {
         const statusCode = turnstileStatus.code === "turnstile_network_error" ? 503 : 403;
@@ -2735,6 +3038,10 @@ app.post(
       let modelUsed: string = agentProfile.modelChain[0];
 
       try {
+        const voiceInstruction = req.body?.voice_mode
+          ? "MODE PERCAKAPAN SUARA (VOICE MODE): Anda sedang berbicara secara lisan langsung dengan pengguna. Jawab dengan SANGAT RINGKAS (1-3 kalimat saja), luwes, santai, dan alami seperti percakapan lisan manusia sehari-hari. DILARANG KERAS menggunakan format markdown (seperti *, **, #, `), poin angka/bullet, emotikon berlebihan, blok kode, URL, atau tabel, karena jawaban ini akan langsung disuarakan dengan Text-To-Speech."
+          : undefined;
+
         if (wantsStream) {
           // Send SSE headers & meta event immediately, and start 15s heartbeat interval immediately (#1)
           if (!sseStarted && !res.headersSent) {
@@ -2774,7 +3081,8 @@ app.post(
               if (sseStarted && !res.writableEnded && !clientDisconnected) {
                 res.write(`data: ${JSON.stringify({ type: "chunk", text: chunkText })}\n\n`);
               }
-            }
+            },
+            voiceInstruction
           );
           aiResponseText = result.text;
           modelUsed = result.modelUsed;
@@ -2790,7 +3098,9 @@ app.post(
             geminiContents,
             signal,
             log,
-            agentProfile
+            agentProfile,
+            undefined,
+            voiceInstruction
           );
           aiResponseText = result.text;
           modelUsed = result.modelUsed;
