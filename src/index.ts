@@ -208,43 +208,21 @@ const configuredOrigins = rawConfiguredOrigins
   .map((o) => o.trim().replace(/\/+$/, ""))
   .filter(Boolean);
 
-// Origin resmi frontend produksi (Vercel & domain kustom)
+// Origin resmi frontend produksi & lokal
 const defaultProductionOrigins = [
   "https://axioma.my.id",
   "https://www.axioma.my.id",
   "https://axioma-fe.vercel.app",
   "https://axioma.id",
   "https://www.axioma.id",
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
 ];
 
 const allowedOrigins = new Set<string>([
   ...defaultProductionOrigins,
   ...configuredOrigins,
 ]);
-
-if (!IS_PRODUCTION) {
-  allowedOrigins.add("http://localhost:3000");
-  allowedOrigins.add("http://127.0.0.1:3000");
-}
-
-app.use((req: Request, res: Response, next: NextFunction) => {
-  const originHeader = req.headers.origin;
-  if (originHeader !== undefined) {
-    const normalizedOrigin = String(originHeader).trim().replace(/\/+$/, "");
-    if (
-      !normalizedOrigin ||
-      normalizedOrigin.toLowerCase() === "null" ||
-      !allowedOrigins.has(normalizedOrigin)
-    ) {
-      return res.status(403).json({
-        success: false,
-        code: "cors_forbidden",
-        error: "Origin tidak diizinkan oleh kebijakan keamanan CORS.",
-      });
-    }
-  }
-  next();
-});
 
 app.use(
   cors({
@@ -253,13 +231,27 @@ app.use(
         return callback(null, true);
       }
       const normalized = origin.trim().replace(/\/+$/, "");
-      if (normalized.toLowerCase() !== "null" && allowedOrigins.has(normalized)) {
+      if (
+        normalized.toLowerCase() !== "null" &&
+        (allowedOrigins.has(normalized) ||
+          (normalized.endsWith(".vercel.app") && normalized.includes("axioma")))
+      ) {
         return callback(null, normalized);
       }
       return callback(null, false);
     },
+    credentials: true,
     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-User-Id", "Accept"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "X-User-Id",
+      "X-Guest-Mode",
+      "X-Turnstile-Token",
+      "CF-Turnstile-Token",
+      "X-Origin-Secret",
+      "Accept",
+    ],
     maxAge: 86400,
   })
 );
@@ -1051,57 +1043,60 @@ export function makeChatTitle(text: string): string {
 
 
 /**
- * Resolves the calling user strictly (#1):
- * - Requires either a valid `Authorization: Bearer <jwt>` header OR a non-empty `X-User-Id` header.
- * - Requests without a valid identity header are ALWAYS rejected with 401 Unauthorized.
+ * Resolves the calling user:
+ * - Checks for `x-guest-mode: true` -> returns guest user immediately.
+ * - If `Authorization: Bearer <jwt>` is provided and valid, verifies via Supabase Auth.
+ * - In Guest Mode (no valid JWT), assigns a guest identity and permits access to Gemini AI chat without 401 error.
  */
 async function resolveRequestUser(
   req: Request,
   log: Logger
 ): Promise<{ user: ResolvedUser | null; authError?: string }> {
-  if (req.headers["x-guest-mode"] === "true") {
-    const rawHeaderUserId = req.headers["x-user-id"];
-    const headerUserId = typeof rawHeaderUserId === "string" ? rawHeaderUserId.trim() : "";
-    return {
-      user: {
-        id: headerUserId && headerUserId.length >= 3 ? headerUserId : "guest-user",
-        authenticated: false,
-      },
-    };
-  }
-
+  const isExplicitGuest = req.headers["x-guest-mode"] === "true";
   const authHeader = req.headers.authorization;
+  let rawToken = "";
   if (authHeader && authHeader.toLowerCase().startsWith("bearer ")) {
-    const token = authHeader.slice(7).trim();
-    if (!token) {
-      return { user: null, authError: "Token autentikasi kosong." };
-    }
-    const { data, error } = await supabase.auth.getUser(token);
-    if (error || !data?.user) {
-      log.warn(`AUTH invalid bearer token: ${error?.message || "no user"}`);
-      return { user: null, authError: "Token autentikasi tidak valid atau sudah kedaluwarsa." };
-    }
-    return { user: { id: data.user.id, authenticated: true } };
+    rawToken = authHeader.slice(7).trim();
   }
 
+  const hasValidToken = Boolean(
+    rawToken &&
+      rawToken !== "null" &&
+      rawToken !== "undefined" &&
+      rawToken !== '""' &&
+      rawToken.length > 10
+  );
+
+  if (!isExplicitGuest && hasValidToken) {
+    try {
+      const { data, error } = await supabase.auth.getUser(rawToken);
+      if (!error && data?.user) {
+        return { user: { id: data.user.id, authenticated: true } };
+      }
+      log.warn(`AUTH token validation failed: ${error?.message || "no user"}. Falling back to guest mode.`);
+    } catch (err: any) {
+      log.warn(`AUTH token exception: ${err?.message || "unknown"}. Falling back to guest mode.`);
+    }
+  }
+
+  // Guest Mode: Allow without authentication
   const rawHeaderUserId = req.headers["x-user-id"];
   const headerUserId = typeof rawHeaderUserId === "string" ? rawHeaderUserId.trim() : "";
+  const effectiveId =
+    headerUserId &&
+    headerUserId !== "null" &&
+    headerUserId !== "undefined" &&
+    headerUserId.length >= 3 &&
+    headerUserId.length <= 128
+      ? headerUserId
+      : `guest-${randomUUID().slice(0, 8)}`;
 
-  if (!headerUserId) {
-    return {
-      user: null,
-      authError: "Autentikasi diperlukan: header X-User-Id atau Authorization Bearer tidak ditemukan.",
-    };
-  }
-
-  if (headerUserId.length < 3 || headerUserId.length > 128) {
-    return {
-      user: null,
-      authError: "Identitas pengguna (X-User-Id) tidak valid.",
-    };
-  }
-
-  return { user: { id: headerUserId, authenticated: false } };
+  return {
+    user: {
+      id: effectiveId,
+      authenticated: false,
+    },
+  };
 }
 
 function getEffectiveChatOwner(chatId: string, existingChat?: Record<string, any> | null): string | undefined {
