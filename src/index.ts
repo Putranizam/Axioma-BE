@@ -33,6 +33,13 @@ import {
   modelCooldownUntil,
   COOLDOWN_DURATIONS,
 } from "./geminiModels";
+import {
+  detectImageGenerationIntent,
+  detectVideoGenerationIntent,
+  generateMediaImage,
+  generateMediaVideo,
+  cleanUserPrompt,
+} from "./mediaGen";
 
 const app = express();
 const PORT = process.env.PORT || 8000;
@@ -2622,6 +2629,86 @@ app.post(
   }
 );
 
+// Media Generation Endpoint 1: POST /api/generate/image
+app.post(
+  "/api/generate/image",
+  express.json({ limit: "100kb" }),
+  async (req: Request, res: Response) => {
+    const requestId = randomUUID().slice(0, 8);
+    const log = createLogger(requestId);
+    const clientIp = getClientIp(req);
+
+    const { prompt } = req.body || {};
+    if (!prompt || typeof prompt !== "string" || !prompt.trim()) {
+      return res.status(400).json({
+        success: false,
+        code: "prompt_required",
+        error: "Prompt untuk pembuatan gambar diperlukan.",
+      });
+    }
+
+    try {
+      log.info(`Generating image for prompt: "${prompt.slice(0, 50)}..." from ip=${clientIp}`);
+      const result = await generateMediaImage(prompt);
+      return res.status(200).json({
+        success: true,
+        url: result.url,
+        source: result.source,
+        enhanced_prompt: result.enhancedPrompt,
+        original_prompt: result.originalPrompt,
+      });
+    } catch (err: any) {
+      log.error("Image generation failed", err);
+      return res.status(500).json({
+        success: false,
+        code: "image_gen_failed",
+        error: "Gagal membuat gambar. Silakan coba lagi.",
+      });
+    }
+  }
+);
+
+// Media Generation Endpoint 2: POST /api/generate/video
+app.post(
+  "/api/generate/video",
+  express.json({ limit: "100kb" }),
+  async (req: Request, res: Response) => {
+    const requestId = randomUUID().slice(0, 8);
+    const log = createLogger(requestId);
+    const clientIp = getClientIp(req);
+
+    const { prompt } = req.body || {};
+    if (!prompt || typeof prompt !== "string" || !prompt.trim()) {
+      return res.status(400).json({
+        success: false,
+        code: "prompt_required",
+        error: "Prompt untuk pembuatan video diperlukan.",
+      });
+    }
+
+    try {
+      log.info(`Generating video design for prompt: "${prompt.slice(0, 50)}..." from ip=${clientIp}`);
+      const result = await generateMediaVideo(prompt);
+      return res.status(200).json({
+        success: true,
+        status: result.status,
+        video_url: result.videoUrl,
+        operation_name: result.operationName,
+        enhanced_prompt: result.enhancedPrompt,
+        original_prompt: result.originalPrompt,
+        message: result.message,
+      });
+    } catch (err: any) {
+      log.error("Video generation failed", err);
+      return res.status(500).json({
+        success: false,
+        code: "video_gen_failed",
+        error: "Gagal memproses permintaan video.",
+      });
+    }
+  }
+);
+
 // Track in-flight streaming requests per chat so DELETE /api/chats/:id can abort background streams immediately (#2)
 const activeChatStreams = new Map<string, AbortController>();
 
@@ -3124,13 +3211,14 @@ app.post(
       let streamedTextSoFar = "";
       let modelUsed: string = agentProfile.modelChain[0];
 
-      try {
-        const voiceInstruction = req.body?.voice_mode
-          ? "MODE PERCAKAPAN SUARA (VOICE MODE): Anda sedang berbicara secara lisan langsung dengan pengguna. Jawab dengan SANGAT RINGKAS (1-3 kalimat saja), luwes, santai, dan alami seperti percakapan lisan manusia sehari-hari. DILARANG KERAS menggunakan format markdown (seperti *, **, #, `), poin angka/bullet, emotikon berlebihan, blok kode, URL, atau tabel, karena jawaban ini akan langsung disuarakan dengan Text-To-Speech."
-          : undefined;
+      // Check for Media Generation Intent (Image or Video)
+      const isImageRequest = (req.body as any)?.media_mode === "image" || detectImageGenerationIntent(userContent);
+      const isVideoRequest = (req.body as any)?.media_mode === "video" || detectVideoGenerationIntent(userContent);
 
+      if (isImageRequest && userContent) {
+        log.info(`STEP3 Media Intent: IMAGE generation for prompt="${userContent.slice(0, 50)}..."`);
+        modelUsed = "gemini-imagen-flux";
         if (wantsStream) {
-          // Send SSE headers & meta event immediately, and start 15s heartbeat interval immediately (#1)
           if (!sseStarted && !res.headersSent) {
             sseStarted = true;
             res.status(200);
@@ -3139,7 +3227,6 @@ app.post(
             res.setHeader("Connection", "keep-alive");
             res.setHeader("X-Accel-Buffering", "no");
             res.flushHeaders?.();
-            // Emit authoritative UUIDs immediately on stream start so frontend has real IDs right away (#4)
             res.write(
               `data: ${JSON.stringify({
                 type: "meta",
@@ -3151,100 +3238,208 @@ app.post(
                 chat: { id: trimmedChatId, title: chatTitle },
               })}\n\n`
             );
-            // Start heartbeat timer immediately so ": ping\n\n" is sent every 15s while waiting for first chunk
             startHeartbeat();
           }
 
-          const result = await generateWithFallbackAndRetry(
-            geminiContents,
-            signal,
-            log,
-            agentProfile,
-            (chunkText) => {
-              streamedTextSoFar += chunkText;
-              // Extend request watchdog on every streamed chunk so active streams never time out (#5)
-              resetWatchdog(STREAM_WATCHDOG_EXTENSION_MS);
-
-              if (sseStarted && !res.writableEnded && !clientDisconnected) {
-                res.write(`data: ${JSON.stringify({ type: "chunk", text: chunkText })}\n\n`);
-              }
-            },
-            voiceInstruction
+          res.write(
+            `data: ${JSON.stringify({
+              type: "chunk",
+              text: "🎨 *Mengoptimalkan prompt visual dengan kecerdasan Gemini AI...*\n\n",
+            })}\n\n`
           );
-          aiResponseText = result.text;
-          modelUsed = result.modelUsed;
-          stageTimings.ai_model_used = result.modelUsed;
-          stageTimings.ai_fallback_count = result.fallbackCount;
-          stageTimings.ai_fallback_overhead_ms = result.fallbackOverheadMs;
-          stageTimings.ai_first_chunk_ms = result.firstChunkMs;
-          stageTimings.ai_stream_ms = result.streamMs;
-          stageTimings.ai_total_ms = result.totalAiMs;
-          stageTimings.ai_attempts = result.attempts;
+
+          const imgResult = await generateMediaImage(userContent);
+          const cleanedSubj = cleanUserPrompt(userContent) || "Gambar AI";
+          const sourceLabel = imgResult.source === "imagen-3" ? "Google Imagen 3" : "Flux High-Res";
+
+          aiResponseText = `Berikut adalah hasil gambar berkualitas tinggi yang dihasilkan berdasarkan permintaan Anda:\n\n![${cleanedSubj}](${imgResult.url})\n\n> **✨ Prompt yang Disempurnakan (Gemini AI):**  \n> *${imgResult.enhancedPrompt}*\n>\n> *Mesin: ${sourceLabel} · Resolusi: 1024×1024 HD*`;
+
+          res.write(
+            `data: ${JSON.stringify({
+              type: "chunk",
+              text: `Berikut adalah hasil gambar berkualitas tinggi yang dihasilkan berdasarkan permintaan Anda:\n\n![${cleanedSubj}](${imgResult.url})\n\n> **✨ Prompt yang Disempurnakan (Gemini AI):**  \n> *${imgResult.enhancedPrompt}*\n>\n> *Mesin: ${sourceLabel} · Resolusi: 1024×1024 HD*`,
+            })}\n\n`
+          );
         } else {
-          const result = await generateWithFallbackAndRetry(
-            geminiContents,
-            signal,
-            log,
-            agentProfile,
-            undefined,
-            voiceInstruction
-          );
-          aiResponseText = result.text;
-          modelUsed = result.modelUsed;
-          stageTimings.ai_model_used = result.modelUsed;
-          stageTimings.ai_fallback_count = result.fallbackCount;
-          stageTimings.ai_fallback_overhead_ms = result.fallbackOverheadMs;
-          stageTimings.ai_first_chunk_ms = result.firstChunkMs;
-          stageTimings.ai_stream_ms = result.streamMs;
-          stageTimings.ai_total_ms = result.totalAiMs;
-          stageTimings.ai_attempts = result.attempts;
-        }
-      } catch (aiError: any) {
-        const partial = (
-          (aiError instanceof AiGenerationError ? aiError.partialText : "") || streamedTextSoFar
-        ).trim();
+          const imgResult = await generateMediaImage(userContent);
+          const cleanedSubj = cleanUserPrompt(userContent) || "Gambar AI";
+          const sourceLabel = imgResult.source === "imagen-3" ? "Google Imagen 3" : "Flux High-Res";
 
-        // #6 & #8: Keep user + AI messages consistent on stream failure or user stop:
-        // - If partial text was generated OR client explicitly stopped generation, save the AI message
-        //   with `preGeneratedAiMsgId` and `_[Respons dihentikan]_` so immediate UI and reload match 100%.
-        if ((partial.length > 0 || clientDisconnected) && !isGuestMode) {
-          let savedPartial: string;
-          if (clientDisconnected) {
-            savedPartial =
-              partial.length > 0
-                ? partial.includes("[Respons dihentikan]")
-                  ? partial
-                  : `${partial}\n\n_[Respons dihentikan]_`
-                : "_[Respons dihentikan]_";
-          } else {
-            savedPartial = partial.endsWith("_")
-              ? partial
-              : `${partial}\n\n_[Respons terhenti karena gangguan koneksi]_`;
+          aiResponseText = `Berikut adalah hasil gambar berkualitas tinggi yang dihasilkan berdasarkan permintaan Anda:\n\n![${cleanedSubj}](${imgResult.url})\n\n> **✨ Prompt yang Disempurnakan (Gemini AI):**  \n> *${imgResult.enhancedPrompt}*\n>\n> *Mesin: ${sourceLabel} · Resolusi: 1024×1024 HD*`;
+        }
+      } else if (isVideoRequest && userContent) {
+        log.info(`STEP3 Media Intent: VIDEO generation for prompt="${userContent.slice(0, 50)}..."`);
+        modelUsed = "gemini-veo-2";
+        if (wantsStream) {
+          if (!sseStarted && !res.headersSent) {
+            sseStarted = true;
+            res.status(200);
+            res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+            res.setHeader("Cache-Control", "no-cache, no-transform");
+            res.setHeader("Connection", "keep-alive");
+            res.setHeader("X-Accel-Buffering", "no");
+            res.flushHeaders?.();
+            res.write(
+              `data: ${JSON.stringify({
+                type: "meta",
+                user_message_id: insertedUserMessageId,
+                ai_message_id: preGeneratedAiMsgId,
+                message_id: preGeneratedAiMsgId,
+                agent_id: agentProfile.id,
+                agent_name: agentProfile.label,
+                chat: { id: trimmedChatId, title: chatTitle },
+              })}\n\n`
+            );
+            startHeartbeat();
           }
-          const { id: partialMsgId } = await insertAiMessageRow(
-            trimmedChatId,
-            savedPartial,
-            agentProfile,
-            preGeneratedAiMsgId
-          );
-          log.info(
-            `STEP3 saved partial/stopped AI response (${savedPartial.length} chars, id=${
-              partialMsgId || preGeneratedAiMsgId
-            }) after stream interruption`
-          );
-        }
 
-        if (aiError instanceof AiGenerationError) {
-          log.error(
-            `STEP3 Gemini failed (${aiError.kind}, status=${aiError.httpStatus}): ${aiError.message}`
+          res.write(
+            `data: ${JSON.stringify({
+              type: "chunk",
+              text: "🎬 *Menganalisis dan merancang koreografi video sinematik dengan Google Veo 2...*\n\n",
+            })}\n\n`
           );
-          return sendJson(aiError.httpStatus, {
-            success: false,
-            code: aiError.kind,
-            error: aiError.message,
-          });
+
+          const videoResult = await generateMediaVideo(userContent);
+          const cleanedSubj = cleanUserPrompt(userContent) || "Video AI";
+
+          aiResponseText = `### 🎬 Desain Sinematik Video (Google Veo 2)\n\nPermintaan video Anda telah dianalisis dan dirancang dengan parameter sinematik profesional:\n\n> **✨ Prompt Sinematik (Veo 2):**  \n> *${videoResult.enhancedPrompt}*\n\n---\n\nℹ️ **Status Layanan Google Veo 2:**  \n${videoResult.message}\n\n💡 *Tips: Anda juga dapat membuat visual Gambar HD secara langsung (misal: "buatkan gambar ${cleanedSubj}") yang didukung oleh Gemini Imagen 3 & Flux.*`;
+
+          res.write(
+            `data: ${JSON.stringify({
+              type: "chunk",
+              text: aiResponseText,
+            })}\n\n`
+          );
+        } else {
+          const videoResult = await generateMediaVideo(userContent);
+          const cleanedSubj = cleanUserPrompt(userContent) || "Video AI";
+
+          aiResponseText = `### 🎬 Desain Sinematik Video (Google Veo 2)\n\nPermintaan video Anda telah dianalisis dan dirancang dengan parameter sinematik profesional:\n\n> **✨ Prompt Sinematik (Veo 2):**  \n> *${videoResult.enhancedPrompt}*\n\n---\n\nℹ️ **Status Layanan Google Veo 2:**  \n${videoResult.message}\n\n💡 *Tips: Anda juga dapat membuat visual Gambar HD secara langsung (misal: "buatkan gambar ${cleanedSubj}") yang didukung oleh Gemini Imagen 3 & Flux.*`;
         }
-        throw aiError;
+      } else {
+        try {
+          const voiceInstruction = req.body?.voice_mode
+            ? "MODE PERCAKAPAN SUARA (VOICE MODE): Anda sedang berbicara secara lisan langsung dengan pengguna. Jawab dengan SANGAT RINGKAS (1-3 kalimat saja), luwes, santai, dan alami seperti percakapan lisan manusia sehari-hari. DILARANG KERAS menggunakan format markdown (seperti *, **, #, `), poin angka/bullet, emotikon berlebihan, blok kode, URL, atau tabel, karena jawaban ini akan langsung disuarakan dengan Text-To-Speech."
+            : undefined;
+
+          if (wantsStream) {
+            // Send SSE headers & meta event immediately, and start 15s heartbeat interval immediately (#1)
+            if (!sseStarted && !res.headersSent) {
+              sseStarted = true;
+              res.status(200);
+              res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+              res.setHeader("Cache-Control", "no-cache, no-transform");
+              res.setHeader("Connection", "keep-alive");
+              res.setHeader("X-Accel-Buffering", "no");
+              res.flushHeaders?.();
+              // Emit authoritative UUIDs immediately on stream start so frontend has real IDs right away (#4)
+              res.write(
+                `data: ${JSON.stringify({
+                  type: "meta",
+                  user_message_id: insertedUserMessageId,
+                  ai_message_id: preGeneratedAiMsgId,
+                  message_id: preGeneratedAiMsgId,
+                  agent_id: agentProfile.id,
+                  agent_name: agentProfile.label,
+                  chat: { id: trimmedChatId, title: chatTitle },
+                })}\n\n`
+              );
+              // Start heartbeat timer immediately so ": ping\n\n" is sent every 15s while waiting for first chunk
+              startHeartbeat();
+            }
+
+            const result = await generateWithFallbackAndRetry(
+              geminiContents,
+              signal,
+              log,
+              agentProfile,
+              (chunkText) => {
+                streamedTextSoFar += chunkText;
+                // Extend request watchdog on every streamed chunk so active streams never time out (#5)
+                resetWatchdog(STREAM_WATCHDOG_EXTENSION_MS);
+
+                if (sseStarted && !res.writableEnded && !clientDisconnected) {
+                  res.write(`data: ${JSON.stringify({ type: "chunk", text: chunkText })}\n\n`);
+                }
+              },
+              voiceInstruction
+            );
+            aiResponseText = result.text;
+            modelUsed = result.modelUsed;
+            stageTimings.ai_model_used = result.modelUsed;
+            stageTimings.ai_fallback_count = result.fallbackCount;
+            stageTimings.ai_fallback_overhead_ms = result.fallbackOverheadMs;
+            stageTimings.ai_first_chunk_ms = result.firstChunkMs;
+            stageTimings.ai_stream_ms = result.streamMs;
+            stageTimings.ai_total_ms = result.totalAiMs;
+            stageTimings.ai_attempts = result.attempts;
+          } else {
+            const result = await generateWithFallbackAndRetry(
+              geminiContents,
+              signal,
+              log,
+              agentProfile,
+              undefined,
+              voiceInstruction
+            );
+            aiResponseText = result.text;
+            modelUsed = result.modelUsed;
+            stageTimings.ai_model_used = result.modelUsed;
+            stageTimings.ai_fallback_count = result.fallbackCount;
+            stageTimings.ai_fallback_overhead_ms = result.fallbackOverheadMs;
+            stageTimings.ai_first_chunk_ms = result.firstChunkMs;
+            stageTimings.ai_stream_ms = result.streamMs;
+            stageTimings.ai_total_ms = result.totalAiMs;
+            stageTimings.ai_attempts = result.attempts;
+          }
+        } catch (aiError: any) {
+          const partial = (
+            (aiError instanceof AiGenerationError ? aiError.partialText : "") || streamedTextSoFar
+          ).trim();
+
+          // #6 & #8: Keep user + AI messages consistent on stream failure or user stop:
+          // - If partial text was generated OR client explicitly stopped generation, save the AI message
+          //   with `preGeneratedAiMsgId` and `_[Respons dihentikan]_` so immediate UI and reload match 100%.
+          if ((partial.length > 0 || clientDisconnected) && !isGuestMode) {
+            let savedPartial: string;
+            if (clientDisconnected) {
+              savedPartial =
+                partial.length > 0
+                  ? partial.includes("[Respons dihentikan]")
+                    ? partial
+                    : `${partial}\n\n_[Respons dihentikan]_`
+                  : "_[Respons dihentikan]_";
+            } else {
+              savedPartial = partial.endsWith("_")
+                ? partial
+                : `${partial}\n\n_[Respons terhenti karena gangguan koneksi]_`;
+            }
+            const { id: partialMsgId } = await insertAiMessageRow(
+              trimmedChatId,
+              savedPartial,
+              agentProfile,
+              preGeneratedAiMsgId
+            );
+            log.info(
+              `STEP3 saved partial/stopped AI response (${savedPartial.length} chars, id=${
+                partialMsgId || preGeneratedAiMsgId
+              }) after stream interruption`
+            );
+          }
+
+          if (aiError instanceof AiGenerationError) {
+            log.error(
+              `STEP3 Gemini failed (${aiError.kind}, status=${aiError.httpStatus}): ${aiError.message}`
+            );
+            return sendJson(aiError.httpStatus, {
+              success: false,
+              code: aiError.kind,
+              error: aiError.message,
+            });
+          }
+          throw aiError;
+        }
       }
 
       // Step 4: Insert generated AI response into Supabase 'messages' table using `preGeneratedAiMsgId` (#4)
