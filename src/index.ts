@@ -948,6 +948,7 @@ interface SendMessageRequest {
   turnstile_token?: string;
   attachment_ids?: string[];
   voice_mode?: boolean;
+  history?: Array<{ id?: string; role: string; content: string; created_at?: string }>;
 }
 
 interface ApiResponse<T = any> {
@@ -1058,6 +1059,17 @@ async function resolveRequestUser(
   req: Request,
   log: Logger
 ): Promise<{ user: ResolvedUser | null; authError?: string }> {
+  if (req.headers["x-guest-mode"] === "true") {
+    const rawHeaderUserId = req.headers["x-user-id"];
+    const headerUserId = typeof rawHeaderUserId === "string" ? rawHeaderUserId.trim() : "";
+    return {
+      user: {
+        id: headerUserId && headerUserId.length >= 3 ? headerUserId : "guest-user",
+        authenticated: false,
+      },
+    };
+  }
+
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.toLowerCase().startsWith("bearer ")) {
     const token = authHeader.slice(7).trim();
@@ -1692,6 +1704,13 @@ app.get("/api/chats", async (req: Request, res: Response) => {
       });
     }
 
+    if (req.headers["x-guest-mode"] === "true" || !user.authenticated) {
+      return res.status(200).json({
+        success: true,
+        data: [],
+      });
+    }
+
     const { data: allChats, error: chatsError } = await supabase
       .from("chats")
       .select("*")
@@ -1782,6 +1801,13 @@ app.get("/api/chats/:id/messages", async (req: Request<{ id: string }>, res: Res
         success: false,
         code: "unauthorized",
         error: authError || "Autentikasi diperlukan.",
+      });
+    }
+
+    if (req.headers["x-guest-mode"] === "true" || !user.authenticated) {
+      return res.status(200).json({
+        success: true,
+        data: { deletedCount: 0 },
       });
     }
 
@@ -2814,98 +2840,123 @@ app.post(
         });
       }
 
+      const isGuestMode = req.headers["x-guest-mode"] === "true" || !user.authenticated;
       const userContent = content.trim();
 
-      // Step 1: Verify chat existence & ownership + fetch chat history in parallel (#7)
-      log.info("STEP1 verify chat & load history in Supabase");
-      const tDbVerifyStart = Date.now();
-      const [chatResult, historyResult] = await Promise.all([
-        supabase
-          .from("chats")
-          .select("*")
-          .eq("id", trimmedChatId)
-          .abortSignal(signal)
-          .maybeSingle(),
-        supabase
-          .from("messages")
-          .select("id, role, content, created_at")
-          .eq("chat_id", trimmedChatId)
-          .order("created_at", { ascending: true })
-          .abortSignal(signal),
-      ]);
-      stageTimings.db_verify_and_history_ms = Date.now() - tDbVerifyStart;
-
-      if (chatResult.error) {
-        log.error("STEP1 Supabase chat select error", chatResult.error);
-        return sendJson(500, {
-          success: false,
-          code: "database_error",
-          error: `Gagal memeriksa data percakapan: ${chatResult.error.message}`,
-        });
-      }
-
-      const existingChat = chatResult.data;
-      const historyRows = (historyResult.data || []) as Array<{
+      let existingChat: any = null;
+      let chatTitle = DEFAULT_CHAT_TITLE;
+      let needsTitleUpdate = false;
+      let historyRows: Array<{
         id: string;
         role: string;
         content: string;
         created_at: string;
-      }>;
+      }> = [];
 
-      const ownership = verifyChatOwnership(trimmedChatId, existingChat, user);
-      if (!ownership.allowed) {
-        log.warn(`STEP1 ownership check rejected for chat_id=${trimmedChatId} user=${user.id}`);
-        return sendJson(403, {
-          success: false,
-          code: "forbidden",
-          error: ownership.reason || "Akses ditolak.",
-        });
-      }
-
-      let chatTitle = existingChat?.title || DEFAULT_CHAT_TITLE;
-      const needsTitleUpdate =
-        !existingChat || !existingChat.title || existingChat.title === DEFAULT_CHAT_TITLE;
-
-      if (!existingChat) {
-        chatTitle = hasContent ? makeChatTitle(userContent) : "Analisis Dokumen / Gambar";
-        const tCreateChatStart = Date.now();
-        let chatInsertError: any = null;
-
-        if (dbHasChatsUserIdColumn !== false) {
-          const { error } = await supabase
+      if (!isGuestMode) {
+        // Step 1: Verify chat existence & ownership + fetch chat history in parallel (#7)
+        log.info("STEP1 verify chat & load history in Supabase");
+        const tDbVerifyStart = Date.now();
+        const [chatResult, historyResult] = await Promise.all([
+          supabase
             .from("chats")
-            .insert({ id: trimmedChatId, title: chatTitle, user_id: user.id })
-            .abortSignal(signal);
-          if (!error) {
-            dbHasChatsUserIdColumn = true;
-          } else if (isMissingColumnError(error)) {
-            dbHasChatsUserIdColumn = false;
-          } else {
-            chatInsertError = error;
-          }
-        }
+            .select("*")
+            .eq("id", trimmedChatId)
+            .abortSignal(signal)
+            .maybeSingle(),
+          supabase
+            .from("messages")
+            .select("id, role, content, created_at")
+            .eq("chat_id", trimmedChatId)
+            .order("created_at", { ascending: true })
+            .abortSignal(signal),
+        ]);
+        stageTimings.db_verify_and_history_ms = Date.now() - tDbVerifyStart;
 
-        if (dbHasChatsUserIdColumn === false) {
-          const { error } = await supabase
-            .from("chats")
-            .insert({ id: trimmedChatId, title: chatTitle })
-            .abortSignal(signal);
-          chatInsertError = error;
-        }
-
-        stageTimings.db_create_chat_ms = Date.now() - tCreateChatStart;
-
-        if (chatInsertError && chatInsertError.code !== "23505") {
-          log.error("STEP1 Supabase chat insert error", chatInsertError);
+        if (chatResult.error) {
+          log.error("STEP1 Supabase chat select error", chatResult.error);
           return sendJson(500, {
             success: false,
             code: "database_error",
-            error: `Gagal membuat percakapan baru: ${chatInsertError.message}`,
+            error: `Gagal memeriksa data percakapan: ${chatResult.error.message}`,
           });
         }
-        recordChatOwner(trimmedChatId, user.id);
-        isNewlyCreatedChat = true;
-        log.info(`STEP1 created new chat row title_length=${chatTitle.length}`);
+
+        existingChat = chatResult.data;
+        historyRows = (historyResult.data || []) as Array<{
+          id: string;
+          role: string;
+          content: string;
+          created_at: string;
+        }>;
+
+        const ownership = verifyChatOwnership(trimmedChatId, existingChat, user);
+        if (!ownership.allowed) {
+          log.warn(`STEP1 ownership check rejected for chat_id=${trimmedChatId} user=${user.id}`);
+          return sendJson(403, {
+            success: false,
+            code: "forbidden",
+            error: ownership.reason || "Akses ditolak.",
+          });
+        }
+
+        chatTitle = existingChat?.title || DEFAULT_CHAT_TITLE;
+        needsTitleUpdate =
+          !existingChat || !existingChat.title || existingChat.title === DEFAULT_CHAT_TITLE;
+
+        if (!existingChat) {
+          chatTitle = hasContent ? makeChatTitle(userContent) : "Analisis Dokumen / Gambar";
+          const tCreateChatStart = Date.now();
+          let chatInsertError: any = null;
+
+          if (dbHasChatsUserIdColumn !== false) {
+            const { error } = await supabase
+              .from("chats")
+              .insert({ id: trimmedChatId, title: chatTitle, user_id: user.id })
+              .abortSignal(signal);
+            if (!error) {
+              dbHasChatsUserIdColumn = true;
+            } else if (isMissingColumnError(error)) {
+              dbHasChatsUserIdColumn = false;
+            } else {
+              chatInsertError = error;
+            }
+          }
+
+          if (dbHasChatsUserIdColumn === false) {
+            const { error } = await supabase
+              .from("chats")
+              .insert({ id: trimmedChatId, title: chatTitle })
+              .abortSignal(signal);
+            chatInsertError = error;
+          }
+
+          stageTimings.db_create_chat_ms = Date.now() - tCreateChatStart;
+
+          if (chatInsertError && chatInsertError.code !== "23505") {
+            log.error("STEP1 Supabase chat insert error", chatInsertError);
+            return sendJson(500, {
+              success: false,
+              code: "database_error",
+              error: `Gagal membuat percakapan baru: ${chatInsertError.message}`,
+            });
+          }
+          recordChatOwner(trimmedChatId, user.id);
+          isNewlyCreatedChat = true;
+          log.info(`STEP1 created new chat row title_length=${chatTitle.length}`);
+        }
+      } else {
+        // GUEST MODE: bypass all database operations
+        log.info(`STEP1 Guest mode: bypassing database for chat_id=${trimmedChatId}`);
+        chatTitle = hasContent ? makeChatTitle(userContent) : DEFAULT_CHAT_TITLE;
+        historyRows = Array.isArray(req.body?.history)
+          ? req.body.history.map((m: any) => ({
+              id: typeof m.id === "string" ? m.id : randomUUID(),
+              role: m.role === "assistant" || m.role === "ai" ? "ai" : "user",
+              content: typeof m.content === "string" ? m.content : "",
+              created_at: typeof m.created_at === "string" ? m.created_at : new Date().toISOString(),
+            }))
+          : [];
       }
 
       // Step 2: Handle user message persistence & avoid consecutive orphaned user messages (#4, #6)
@@ -2913,73 +2964,77 @@ app.post(
       const tStep2Start = Date.now();
       let isRetryOfLastMessage = false;
 
-      if (existingChat && historyRows.length > 0) {
-        if (regenerate) {
-          const topMsg = historyRows[historyRows.length - 1];
-          if (topMsg.role === "ai" || topMsg.role === "assistant") {
-            await supabase
-              .from("messages")
-              .delete()
-              .eq("id", topMsg.id)
-              .abortSignal(signal);
-            historyRows.pop();
-            log.info(`STEP2 regenerate: deleted previous AI message id=${topMsg.id}`);
-          }
-          const newTop = historyRows[historyRows.length - 1];
-          if (newTop?.role === "user" && newTop.content.trim() === userContent) {
-            isRetryOfLastMessage = true;
-            insertedUserMessageId = String(newTop.id);
-          }
-        } else {
-          const lastMsg = historyRows[historyRows.length - 1];
-          if (lastMsg.role === "user" && lastMsg.content.trim() === userContent) {
-            isRetryOfLastMessage = true;
-            insertedUserMessageId = String(lastMsg.id);
-          }
-        }
-      }
-
-      if (isRetryOfLastMessage) {
-        log.info(
-          `STEP2 skipped user insert: identical user message is already the latest (id=${insertedUserMessageId})`
-        );
+      if (isGuestMode) {
+        insertedUserMessageId = randomUUID();
       } else {
-        const preGeneratedUserMsgId = randomUUID();
-        const { data: insertedUserRow, error: userInsertError } = await supabase
-          .from("messages")
-          .insert({
-            id: preGeneratedUserMsgId,
-            chat_id: trimmedChatId,
-            role: "user",
-            content: userContent || "(Lampiran)",
-          })
-          .select("id")
-          .abortSignal(signal)
-          .maybeSingle();
-
-        if (userInsertError) {
-          log.error("STEP2 Supabase user message insert error", userInsertError);
-          if (isNewlyCreatedChat && effectiveChatId) {
-            log.warn(`Rolling back newly created empty chat row id=${effectiveChatId} due to user message insert failure`);
-            try {
-              await supabase.from("chats").delete().eq("id", effectiveChatId);
-            } catch {}
-            removeChatOwner(effectiveChatId);
+        if (existingChat && historyRows.length > 0) {
+          if (regenerate) {
+            const topMsg = historyRows[historyRows.length - 1];
+            if (topMsg.role === "ai" || topMsg.role === "assistant") {
+              await supabase
+                .from("messages")
+                .delete()
+                .eq("id", topMsg.id)
+                .abortSignal(signal);
+              historyRows.pop();
+              log.info(`STEP2 regenerate: deleted previous AI message id=${topMsg.id}`);
+            }
+            const newTop = historyRows[historyRows.length - 1];
+            if (newTop?.role === "user" && newTop.content.trim() === userContent) {
+              isRetryOfLastMessage = true;
+              insertedUserMessageId = String(newTop.id);
+            }
+          } else {
+            const lastMsg = historyRows[historyRows.length - 1];
+            if (lastMsg.role === "user" && lastMsg.content.trim() === userContent) {
+              isRetryOfLastMessage = true;
+              insertedUserMessageId = String(lastMsg.id);
+            }
           }
-          return sendJson(500, {
-            success: false,
-            code: "database_error",
-            error: `Gagal menyimpan pesan pengguna: ${userInsertError.message}`,
-          });
         }
-        insertedUserMessageId = insertedUserRow?.id
-          ? String(insertedUserRow.id)
-          : preGeneratedUserMsgId;
+
+        if (isRetryOfLastMessage) {
+          log.info(
+            `STEP2 skipped user insert: identical user message is already the latest (id=${insertedUserMessageId})`
+          );
+        } else {
+          const preGeneratedUserMsgId = randomUUID();
+          const { data: insertedUserRow, error: userInsertError } = await supabase
+            .from("messages")
+            .insert({
+              id: preGeneratedUserMsgId,
+              chat_id: trimmedChatId,
+              role: "user",
+              content: userContent || "(Lampiran)",
+            })
+            .select("id")
+            .abortSignal(signal)
+            .maybeSingle();
+
+          if (userInsertError) {
+            log.error("STEP2 Supabase user message insert error", userInsertError);
+            if (isNewlyCreatedChat && effectiveChatId) {
+              log.warn(`Rolling back newly created empty chat row id=${effectiveChatId} due to user message insert failure`);
+              try {
+                await supabase.from("chats").delete().eq("id", effectiveChatId);
+              } catch {}
+              removeChatOwner(effectiveChatId);
+            }
+            return sendJson(500, {
+              success: false,
+              code: "database_error",
+              error: `Gagal menyimpan pesan pengguna: ${userInsertError.message}`,
+            });
+          }
+          insertedUserMessageId = insertedUserRow?.id
+            ? String(insertedUserRow.id)
+            : preGeneratedUserMsgId;
+        }
       }
       stageTimings.db_user_msg_ms = Date.now() - tStep2Start;
 
       // Link uploaded attachments to this chat & message (#1, #10)
-      if (rawAttachmentIds.length > 0 && insertedUserMessageId) {
+      if (!isGuestMode && rawAttachmentIds.length > 0 && insertedUserMessageId) {
         const { error: linkErr } = await supabase
           .from("message_attachments")
           .update({
@@ -2995,7 +3050,7 @@ app.post(
       }
 
       // Update chat title non-blockingly if existing chat still had "New Chat" (#7)
-      if (existingChat && needsTitleUpdate) {
+      if (!isGuestMode && existingChat && needsTitleUpdate) {
         chatTitle = hasContent ? makeChatTitle(userContent) : "Analisis Dokumen / Gambar";
         void supabase
           .from("chats")
@@ -3157,7 +3212,7 @@ app.post(
         // #6 & #8: Keep user + AI messages consistent on stream failure or user stop:
         // - If partial text was generated OR client explicitly stopped generation, save the AI message
         //   with `preGeneratedAiMsgId` and `_[Respons dihentikan]_` so immediate UI and reload match 100%.
-        if (partial.length > 0 || clientDisconnected) {
+        if ((partial.length > 0 || clientDisconnected) && !isGuestMode) {
           let savedPartial: string;
           if (clientDisconnected) {
             savedPartial =
@@ -3198,41 +3253,45 @@ app.post(
       }
 
       // Step 4: Insert generated AI response into Supabase 'messages' table using `preGeneratedAiMsgId` (#4)
-      log.info("STEP4 insert AI message");
-      const tStep4Start = Date.now();
-      const { id: insertedMessageId, error: aiInsertError } = await insertAiMessageRow(
-        trimmedChatId,
-        aiResponseText,
-        agentProfile,
-        preGeneratedAiMsgId
-      );
-      stageTimings.db_ai_msg_ms = Date.now() - tStep4Start;
-      stageTimings.total_ms = Date.now() - reqStartMs;
+      let finalAiMessageId: string = preGeneratedAiMsgId;
+      if (!isGuestMode) {
+        log.info("STEP4 insert AI message");
+        const tStep4Start = Date.now();
+        const { id: insertedMessageId, error: aiInsertError } = await insertAiMessageRow(
+          trimmedChatId,
+          aiResponseText,
+          agentProfile,
+          preGeneratedAiMsgId
+        );
+        stageTimings.db_ai_msg_ms = Date.now() - tStep4Start;
+        stageTimings.total_ms = Date.now() - reqStartMs;
 
-      if (aiInsertError) {
-        // If chat was deleted by the user while the response was generating, do NOT return 500 error (#2)
-        const isFkChatDeleted =
-          String(aiInsertError.code) === "23503" ||
-          String(aiInsertError.message || "").toLowerCase().includes("foreign key");
-        if (signal.aborted || isFkChatDeleted) {
-          log.info(`Chat ${trimmedChatId} was deleted during/after stream; skipping AI message insert cleanly`);
-          stopHeartbeat();
-          if (sseStarted && !res.writableEnded) {
-            res.end();
+        if (aiInsertError) {
+          // If chat was deleted by the user while the response was generating, do NOT return 500 error (#2)
+          const isFkChatDeleted =
+            String(aiInsertError.code) === "23503" ||
+            String(aiInsertError.message || "").toLowerCase().includes("foreign key");
+          if (signal.aborted || isFkChatDeleted) {
+            log.info(`Chat ${trimmedChatId} was deleted during/after stream; skipping AI message insert cleanly`);
+            stopHeartbeat();
+            if (sseStarted && !res.writableEnded) {
+              res.end();
+            }
+            return;
           }
-          return;
+          log.error("STEP4 Supabase AI message insert error", aiInsertError);
+          return sendJson(500, {
+            success: false,
+            code: "database_error",
+            error: `Gagal menyimpan balasan AI: ${aiInsertError.message}`,
+          });
         }
-        log.error("STEP4 Supabase AI message insert error", aiInsertError);
-        return sendJson(500, {
-          success: false,
-          code: "database_error",
-          error: `Gagal menyimpan balasan AI: ${aiInsertError.message}`,
-        });
+        finalAiMessageId = insertedMessageId || preGeneratedAiMsgId;
+      } else {
+        stageTimings.total_ms = Date.now() - reqStartMs;
       }
 
       log.info(`TIMINGS ${JSON.stringify(stageTimings)}`);
-
-      const finalAiMessageId = insertedMessageId || preGeneratedAiMsgId;
 
       // Step 5: Finish response (modelUsed is logged on backend only, never sent to frontend)
       if (sseStarted) {
@@ -3812,6 +3871,13 @@ app.delete("/api/chats", async (req: Request, res: Response<ApiResponse<{ delete
         success: false,
         code: "unauthorized",
         error: authError || "Autentikasi diperlukan.",
+      });
+    }
+
+    if (req.headers["x-guest-mode"] === "true" || !user.authenticated) {
+      return res.status(200).json({
+        success: true,
+        data: { deletedCount: 0 },
       });
     }
 
