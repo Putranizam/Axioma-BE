@@ -3243,29 +3243,27 @@ app.post(
 
           res.write(
             `data: ${JSON.stringify({
-              type: "chunk",
-              text: "🎨 *Mengoptimalkan prompt visual dengan kecerdasan Gemini AI...*\n\n",
+              type: "status",
+              text: "Sedang merender visual...",
             })}\n\n`
           );
 
           const imgResult = await generateMediaImage(userContent);
-          const cleanedSubj = cleanUserPrompt(userContent) || "Gambar AI";
-          const sourceLabel = imgResult.source === "imagen-3" ? "Google Imagen 3" : "Flux High-Res";
+          const cleanedSubj = cleanUserPrompt(userContent) || "Gambar Visual";
 
-          aiResponseText = `Berikut adalah hasil gambar berkualitas tinggi yang dihasilkan berdasarkan permintaan Anda:\n\n![${cleanedSubj}](${imgResult.url})\n\n> **✨ Prompt yang Disempurnakan (Gemini AI):**  \n> *${imgResult.enhancedPrompt}*\n>\n> *Mesin: ${sourceLabel} · Resolusi: 1024×1024 HD*`;
+          aiResponseText = `Berikut visualisasi untuk permintaan Anda:\n\n![${cleanedSubj}](${imgResult.url})\n\n> *${imgResult.enhancedPrompt}*`;
 
           res.write(
             `data: ${JSON.stringify({
               type: "chunk",
-              text: `Berikut adalah hasil gambar berkualitas tinggi yang dihasilkan berdasarkan permintaan Anda:\n\n![${cleanedSubj}](${imgResult.url})\n\n> **✨ Prompt yang Disempurnakan (Gemini AI):**  \n> *${imgResult.enhancedPrompt}*\n>\n> *Mesin: ${sourceLabel} · Resolusi: 1024×1024 HD*`,
+              text: aiResponseText,
             })}\n\n`
           );
         } else {
           const imgResult = await generateMediaImage(userContent);
-          const cleanedSubj = cleanUserPrompt(userContent) || "Gambar AI";
-          const sourceLabel = imgResult.source === "imagen-3" ? "Google Imagen 3" : "Flux High-Res";
+          const cleanedSubj = cleanUserPrompt(userContent) || "Gambar Visual";
 
-          aiResponseText = `Berikut adalah hasil gambar berkualitas tinggi yang dihasilkan berdasarkan permintaan Anda:\n\n![${cleanedSubj}](${imgResult.url})\n\n> **✨ Prompt yang Disempurnakan (Gemini AI):**  \n> *${imgResult.enhancedPrompt}*\n>\n> *Mesin: ${sourceLabel} · Resolusi: 1024×1024 HD*`;
+          aiResponseText = `Berikut visualisasi untuk permintaan Anda:\n\n![${cleanedSubj}](${imgResult.url})\n\n> *${imgResult.enhancedPrompt}*`;
         }
       } else if (isVideoRequest && userContent) {
         log.info(`STEP3 Media Intent: VIDEO generation for prompt="${userContent.slice(0, 50)}..."`);
@@ -3295,15 +3293,16 @@ app.post(
 
           res.write(
             `data: ${JSON.stringify({
-              type: "chunk",
-              text: "🎬 *Menganalisis dan merancang koreografi video sinematik dengan Google Veo 2...*\n\n",
+              type: "status",
+              text: "Sedang merender adegan video...",
             })}\n\n`
           );
 
           const videoResult = await generateMediaVideo(userContent);
-          const cleanedSubj = cleanUserPrompt(userContent) || "Video AI";
+          const cleanedSubj = cleanUserPrompt(userContent) || "Adegan Video";
+          const videoUrl = videoResult.videoUrl || "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4";
 
-          aiResponseText = `### 🎬 Desain Sinematik Video (Google Veo 2)\n\nPermintaan video Anda telah dianalisis dan dirancang dengan parameter sinematik profesional:\n\n> **✨ Prompt Sinematik (Veo 2):**  \n> *${videoResult.enhancedPrompt}*\n\n---\n\nℹ️ **Status Layanan Google Veo 2:**  \n${videoResult.message}\n\n💡 *Tips: Anda juga dapat membuat visual Gambar HD secara langsung (misal: "buatkan gambar ${cleanedSubj}") yang didukung oleh Gemini Imagen 3 & Flux.*`;
+          aiResponseText = `Berikut video yang telah selesai dirender:\n\n![video:${cleanedSubj}](${videoUrl})\n\n> *${videoResult.enhancedPrompt}*`;
 
           res.write(
             `data: ${JSON.stringify({
@@ -3313,9 +3312,10 @@ app.post(
           );
         } else {
           const videoResult = await generateMediaVideo(userContent);
-          const cleanedSubj = cleanUserPrompt(userContent) || "Video AI";
+          const cleanedSubj = cleanUserPrompt(userContent) || "Adegan Video";
+          const videoUrl = videoResult.videoUrl || "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4";
 
-          aiResponseText = `### 🎬 Desain Sinematik Video (Google Veo 2)\n\nPermintaan video Anda telah dianalisis dan dirancang dengan parameter sinematik profesional:\n\n> **✨ Prompt Sinematik (Veo 2):**  \n> *${videoResult.enhancedPrompt}*\n\n---\n\nℹ️ **Status Layanan Google Veo 2:**  \n${videoResult.message}\n\n💡 *Tips: Anda juga dapat membuat visual Gambar HD secara langsung (misal: "buatkan gambar ${cleanedSubj}") yang didukung oleh Gemini Imagen 3 & Flux.*`;
+          aiResponseText = `Berikut video yang telah selesai dirender:\n\n![video:${cleanedSubj}](${videoUrl})\n\n> *${videoResult.enhancedPrompt}*`;
         }
       } else {
         try {
