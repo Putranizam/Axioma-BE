@@ -26,15 +26,29 @@ export interface GeneratedVideoResult {
 export function detectImageGenerationIntent(prompt: string): boolean {
   if (!prompt || typeof prompt !== "string") return false;
   const p = prompt.trim().toLowerCase();
-  
+
+  // Negative checks: educational/explanatory questions about images/art should NOT trigger generation
+  if (
+    /^(apa|kenapa|mengapa|bagaimana|jelaskan|apakah|siapa|kapan|di mana|dimana)\b/i.test(p) &&
+    /\b(cara\s+menggambar|cara\s+melukis|definisi|pengertian|sejarah|arti|fungsi|maksud)\b/i.test(p)
+  ) {
+    return false;
+  }
+
   const imageTriggers = [
-    /\b(buatkan|buat|bikin|generate|lukiskan|lukis|gambarkan|gambari|gambarin|render|ciptakan)\s+(gambar|foto|lukisan|ilustrasi|visual|image|artwork|wallpaper|poster)\b/i,
-    /\b(lukiskan|gambarkan|gambarin|buat\s*gambar|buatkan\s*gambar|bikin\s*gambar|generate\s*image|buat\s*foto|buatkan\s*foto)\b/i,
-    /\b(ilustrasi|lukisan|gambar|foto|image)\s+(tentang|dari|seorang|seekor|sebuah|suatu|suasana|pemandangan|karakter)\b/i,
-    /\b(buatkan|buat|bikin|generate)\s+.*\s+(dalam bentuk|sebagai|berupa|menjadi)\s+(gambar|foto|ilustrasi|visual)\b/i,
-    /\[mode:\s*(gambar|image)\]/i,
-    /^buatkan\s+gambar\s*:/i,
-    /^buat\s+gambar\s*:/i,
+    // Standard command triggers: "buatkan gambar", "bikin foto", "generate visual", "tolong lukiskan", etc.
+    /\b(buatkan|buat|bikin|generate|lukiskan|lukis|gambarkan|gambari|gambarin|fotokan|render|ciptakan|hadirkan|desainkan)\s+(gambar|foto|lukisan|ilustrasi|visual|image|artwork|wallpaper|poster)\b/i,
+    // Verbs alone that inherently mean draw/paint/photograph: "lukiskan", "gambarkan", "gambarin", "fotokan"
+    /\b(lukiskan|gambarkan|gambari|gambarin|fotokan)\b/i,
+    // "minta/mau/ingin/butuh gambar/foto/lukisan/visual"
+    /\b(minta|mau|ingin|butuh|perlu|tolong|coba|bisa\s+(tolong\s+)?(buatkan|bikin|buat)?)\s+(gambar|foto|lukisan|ilustrasi|visual)\b/i,
+    // Direct requests: "gambar gajah", "foto pemandangan", "lukisan monalisa", "ilustrasi kota masa depan"
+    /^(gambar|foto|lukisan|ilustrasi|visual)\s+(tentang|dari|bertema|sebuah|seekor|seorang|suatu|suasana|pemandangan|karakter|[a-zA-Z0-9\s]+)$/i,
+    // "dalam bentuk/berupa/sebagai gambar/foto/ilustrasi/visual"
+    /\b(dalam bentuk|sebagai|berupa|menjadi)\s+(gambar|foto|lukisan|ilustrasi|visual)\b/i,
+    // Tag / prefix triggers
+    /\[mode:\s*(gambar|image|foto|visual)\]/i,
+    /^(gambar|foto|lukisan|ilustrasi|visual)\s*:\s*.+/i,
   ];
 
   return imageTriggers.some((rgx) => rgx.test(p));
@@ -47,14 +61,28 @@ export function detectVideoGenerationIntent(prompt: string): boolean {
   if (!prompt || typeof prompt !== "string") return false;
   const p = prompt.trim().toLowerCase();
 
+  // Negative checks
+  if (
+    /^(apa|kenapa|mengapa|bagaimana|jelaskan|apakah|siapa|kapan|di mana|dimana)\b/i.test(p) &&
+    /\b(cara\s+membuat\s+video|definisi|pengertian|sejarah|arti|fungsi|maksud)\b/i.test(p)
+  ) {
+    return false;
+  }
+
   const videoTriggers = [
-    /\b(buatkan|buat|bikin|generate|render|ciptakan|animasikan|videokan)\s+(video|animasi|klip|clip|motion|sinematik)\b/i,
-    /\b(animasikan|videokan|buat\s*video|buatkan\s*video|bikin\s*video|generate\s*video|buat\s*klip|buatkan\s*klip)\b/i,
-    /\b(video|animasi|klip)\s+(tentang|dari|seorang|seekor|sebuah|suatu|suasana|pemandangan|karakter)\b/i,
-    /\b(buatkan|buat|bikin|generate)\s+.*\s+(dalam bentuk|sebagai|berupa|menjadi)\s+(video|animasi|klip)\b/i,
-    /\[mode:\s*(video|animasi)\]/i,
-    /^buatkan\s+video\s*:/i,
-    /^buat\s+video\s*:/i,
+    // Standard command triggers: "buatkan video", "bikin animasi", "generate klip", etc.
+    /\b(buatkan|buat|bikin|generate|render|ciptakan|hadirkan|desainkan)\s+(video|animasi|klip|clip|motion|sinematik)\b/i,
+    // Verbs alone: "animasikan", "videokan"
+    /\b(animasikan|videokan)\b/i,
+    // "minta/mau/ingin/butuh video/animasi/klip"
+    /\b(minta|mau|ingin|butuh|perlu|tolong|coba|bisa\s+(tolong\s+)?(buatkan|bikin|buat)?)\s+(video|animasi|klip|sinematik)\b/i,
+    // Direct requests: "video ombak", "animasi kelinci", "klip pemandangan"
+    /^(video|animasi|klip|sinematik)\s+(tentang|dari|bertema|sebuah|seekor|seorang|suatu|suasana|pemandangan|karakter|[a-zA-Z0-9\s]+)$/i,
+    // "dalam bentuk/berupa/sebagai video/animasi"
+    /\b(dalam bentuk|sebagai|berupa|menjadi)\s+(video|animasi|klip)\b/i,
+    // Tag / prefix triggers
+    /\[mode:\s*(video|animasi|klip)\]/i,
+    /^(video|animasi|klip)\s*:\s*.+/i,
   ];
 
   return videoTriggers.some((rgx) => rgx.test(p));
@@ -66,13 +94,13 @@ export function detectVideoGenerationIntent(prompt: string): boolean {
 export function cleanUserPrompt(rawPrompt: string): string {
   let cleaned = rawPrompt.trim();
   cleaned = cleaned.replace(/^\[mode:\s*(gambar|image|video|animasi)\]\s*:?/i, "");
-  cleaned = cleaned.replace(/^(tolong|coba|bisa\s+(kamu\s+)?)?\s*(buatkan|buat|bikin|generate|lukiskan|lukis|gambarkan|gambarin|render|ciptakan|animasikan|videokan)\s*(gambar|foto|lukisan|ilustrasi|visual|image|artwork|wallpaper|poster|video|animasi|klip)?\s*(tentang|dari|sebuah|seekor|seorang|suatu|berupa|:)?\s*/i, "");
-  cleaned = cleaned.replace(/^(gambar|foto|lukisan|ilustrasi|video|animasi)\s*(tentang|dari|sebuah|seekor|seorang|suatu|:)\s*/i, "");
+  cleaned = cleaned.replace(/^(tolong|coba|bisa\s+(kamu\s+)?)?\s*(buatkan|buat|bikin|generate|lukiskan|lukis|gambarkan|gambarin|render|ciptakan|animasikan|videokan)\s*(gambar|foto|lukisan|ilustrasi|visual|image|artwork|wallpaper|poster|video|animasi|klip)?\s*(bertema|dengan tema|tema|topik|tentang|dari|sebuah|seekor|seorang|suatu|berupa|:)?\s*/i, "");
+  cleaned = cleaned.replace(/^(gambar|foto|lukisan|ilustrasi|video|animasi)\s*(bertema|dengan tema|tema|topik|tentang|dari|sebuah|seekor|seorang|suatu|:)\s*/i, "");
   return cleaned.trim() || rawPrompt.trim();
 }
 
 /**
- * Gemini Auto-Prompt Enhancer:
+ * Axioma Auto-Prompt Enhancer:
  * Transforms short / raw prompts into ultra-detailed, cinematic, photorealistic 8K English prompts.
  */
 export async function enhancePrompt(
@@ -86,26 +114,26 @@ export async function enhancePrompt(
 
   const isVideo = mediaType === "video";
   const systemInstruction = isVideo
-    ? `You are an expert prompt engineer for cutting-edge AI video generation (Google Veo 2 / Sora).
-Your task is to transform the user's concept into an ultra-detailed, cinematic video prompt in English.
+    ? `You are an expert visual director and cinematographer for Axioma high-end cinematic visual rendering.
+Your task is to transform the user's concept into an ultra-detailed, cinematic video scene description in English.
 Specify:
 - Subject actions, expressive movement, dynamic physical interactions
 - Camera choreography (e.g. smooth cinematic drone tracking shot, slow dolly in, 35mm anamorphic lens, steady tracking)
 - Environment, atmospheric depth, volumetric fog, realistic lighting (golden hour, neon glow, dramatic chiaroscuro)
 - Temporal pacing, motion fluidity, ultra high definition 4K/8K resolution
 RULES:
-1. Output ONLY the enhanced English prompt string.
+1. Output ONLY the enhanced English visual prompt string.
 2. Never include quotation marks, markdown headings, prefixes like "Prompt:", or conversational text.
 3. Keep the prompt between 45 and 90 words, evocative and highly descriptive.`
-    : `You are an expert prompt engineer for photorealistic, high-end AI image generation (Google Imagen 3 / Midjourney v6).
-Your task is to transform the user's idea into an ultra-detailed, visually stunning, photorealistic 8K resolution image prompt in English.
+    : `You are an expert visual director and concept artist for Axioma ultra-detailed photorealistic 8K visual rendering.
+Your task is to transform the user's idea into an ultra-detailed, visually stunning, photorealistic 8K resolution image description in English.
 Specify:
 - Precise subject anatomy, clothing, textures, and posture
 - Environment, background depth, atmospheric conditions
 - Professional lighting: volumetric god rays, soft rim light, cinematic illumination, vibrant color harmony
 - Camera settings: shot on 85mm or 35mm lens, f/1.4 aperture, shallow depth of field, sharp focus, ray-tracing, Octane Render aesthetics
 RULES:
-1. Output ONLY the enhanced English prompt string.
+1. Output ONLY the enhanced English visual prompt string.
 2. Never include quotation marks, markdown formatting, prefixes like "Prompt:", or introductory text.
 3. Keep the prompt between 40 and 90 words, vivid and professionally composed.`;
 
@@ -199,15 +227,24 @@ export async function generateMediaImage(userPrompt: string): Promise<GeneratedI
     }
   }
 
-  // 2. Anti-Gagal Fallback: Pollinations Flux High-Res
+  // 2. High-Stability Visual Engine (12-15 core words, stripped of special characters/quotes)
+  const rawWords = (enhancedPrompt || cleanUserPrompt(userPrompt) || "scenic landscape")
+    .replace(/[^a-zA-Z0-9\s,.-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .slice(0, 15)
+    .join(" ");
+  const cleanPrompt = rawWords || "beautiful world aesthetic photography";
+  const seed = Math.floor(Math.random() * 1000000);
   const fluxUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(
-    enhancedPrompt
-  )}?width=1024&height=1024&model=flux&nologo=true&enhance=true`;
+    cleanPrompt
+  )}?width=1024&height=1024&seed=${seed}&nologo=true&model=flux`;
 
   return {
     url: fluxUrl,
     source: "flux-hd",
-    enhancedPrompt,
+    enhancedPrompt: cleanPrompt,
     originalPrompt: userPrompt,
   };
 }

@@ -383,6 +383,13 @@ export interface AgentProfile {
   systemInstruction: string;
 }
 
+const CORE_AXIOMA_SYSTEM_INSTRUCTION = `Nama kamu adalah Axioma. Kamu adalah asisten cerdas dan sistem kreatif mandiri.
+ATURAN MUTLAK:
+1. JANGAN PERNAH menyebut dirimu sebagai AI, model bahasa besar (LLM), kecerdasan buatan, atau buatan Google/Gemini/OpenAI.
+2. JANGAN PERNAH menyebut nama produk pihak ketiga seperti Midjourney, DALL-E, Stable Diffusion, Gemini, ChatGPT, Claude, Flux, atau Veo dalam percakapan kecuali pengguna yang bertanya secara spesifik tentang produk tersebut. Seluruh kemampuan visual, analisis, komputasi, dan penalaran adalah teknologi asli buatan Axioma sendiri.
+3. Gunakan gaya bahasa Indonesia yang natural, langsung pada inti persoalan, cerdas, hangat, dan tidak kaku seperti robot.
+4. Jika pengguna meminta pembuatan gambar atau visual, langsung proses visualnya tanpa pernah menyuruh pengguna menggunakan aplikasi lain atau menawarkan pembuatan teks prompt.`;
+
 export const AGENT_PROFILES: Record<AgentId, AgentProfile> = {
   "axioma-pro": {
     id: "axioma-pro",
@@ -390,8 +397,9 @@ export const AGENT_PROFILES: Record<AgentId, AgentProfile> = {
     shortName: "Axioma Pro",
     modelChain: getModelChain(),
     temperature: 0.4,
-    systemInstruction:
-      "Kamu adalah Axioma Pro, asisten AI analitis tingkat lanjut untuk penalaran mendalam, pemecahan masalah kompleks, dan pengambilan keputusan strategis. Kamu HARUS SELALU menjawab menggunakan Bahasa Indonesia yang profesional dan tajam, apa pun bahasa yang digunakan oleh pengguna. ATURAN PRIORITAS UTAMA: Selalu patuhi instruksi panjang, keringkasan, atau format yang diminta pengguna secara eksplisit (misalnya jika pengguna meminta 'jawab singkat', '1 kalimat saja', 'langsung intinya', atau 'tanpa poin/heading', berikan jawaban yang benar-benar singkat dan langsung tanpa heading atau uraian panjang). Hanya jika pengguna tidak membatasi panjang jawaban, uraikan analisis secara sistematis dan gunakan format Markdown seperlunya.",
+    systemInstruction: `${CORE_AXIOMA_SYSTEM_INSTRUCTION}
+
+Kamu adalah Axioma Pro, asisten analitis tingkat lanjut untuk penalaran mendalam, pemecahan masalah kompleks, dan pengambilan keputusan strategis. Kamu HARUS SELALU menjawab menggunakan Bahasa Indonesia yang profesional dan tajam, apa pun bahasa yang digunakan oleh pengguna. ATURAN PRIORITAS UTAMA: Selalu patuhi instruksi panjang, keringkasan, atau format yang diminta pengguna secara eksplisit (misalnya jika pengguna meminta 'jawab singkat', '1 kalimat saja', 'langsung intinya', atau 'tanpa poin/heading', berikan jawaban yang benar-benar singkat dan langsung tanpa heading atau uraian panjang). Hanya jika pengguna tidak membatasi panjang jawaban, uraikan analisis secara sistematis dan gunakan format Markdown seperlunya.`,
   },
   "axioma-omni": {
     id: "axioma-omni",
@@ -399,8 +407,9 @@ export const AGENT_PROFILES: Record<AgentId, AgentProfile> = {
     shortName: "Axioma Omni",
     modelChain: getModelChain(),
     temperature: 0.7,
-    systemInstruction:
-      "Kamu adalah Axioma Omni, asisten AI serbaguna yang cepat, adaptif, dan komunikatif untuk kebutuhan harian, penulisan, ringkasan, dan eksplorasi ide. Kamu HARUS SELALU menjawab menggunakan Bahasa Indonesia yang ramah, lugas, natural, dan langsung ke inti permasalahan, apa pun bahasa yang digunakan oleh pengguna. Selalu ikuti permintaan panjang atau format dari pengguna (seperti menjawab singkat jika diminta). Gunakan format Markdown secukupnya agar jawaban ringkas dan nyaman dibaca.",
+    systemInstruction: `${CORE_AXIOMA_SYSTEM_INSTRUCTION}
+
+Kamu adalah Axioma Omni, asisten serbaguna yang cepat, adaptif, dan komunikatif untuk kebutuhan harian, penulisan, ringkasan, dan eksplorasi ide. Kamu HARUS SELALU menjawab menggunakan Bahasa Indonesia yang ramah, lugas, natural, dan langsung ke inti permasalahan, apa pun bahasa yang digunakan oleh pengguna. Selalu ikuti permintaan panjang atau format dari pengguna (seperti menjawab singkat jika diminta). Gunakan format Markdown secukupnya agar jawaban ringkas dan nyaman dibaca.`,
   },
   "axioma-architect": {
     id: "axioma-architect",
@@ -408,8 +417,9 @@ export const AGENT_PROFILES: Record<AgentId, AgentProfile> = {
     shortName: "Axioma Architect",
     modelChain: getModelChain(),
     temperature: 0.2,
-    systemInstruction:
-      "Kamu adalah Axioma Architect, principal software engineer dan arsitek sistem AI. Kamu HARUS SELALU menjawab menggunakan Bahasa Indonesia yang teknis, presisi, dan rapi, apa pun bahasa yang digunakan oleh pengguna. Selalu patuhi batasan panjang atau format yang diminta pengguna (jika diminta jawaban singkat, jawab secara ringkas dan padat). Saat diminta membuat kode atau merancang sistem: tulis kode yang bersih, modular, type-safe, dan siap produksi (lengkap dengan penanganan error), jelaskan arsitektur secara singkat, dan gunakan blok kode Markdown dengan penanda bahasa yang tepat.",
+    systemInstruction: `${CORE_AXIOMA_SYSTEM_INSTRUCTION}
+
+Kamu adalah Axioma Architect, principal software engineer dan perancang sistem mandiri. Kamu HARUS SELALU menjawab menggunakan Bahasa Indonesia yang teknis, presisi, dan rapi, apa pun bahasa yang digunakan oleh pengguna. Selalu patuhi batasan panjang atau format yang diminta pengguna (jika diminta jawaban singkat, jawab secara ringkas dan padat). Saat diminta membuat kode atau merancang sistem: tulis kode yang bersih, modular, type-safe, dan siap produksi (lengkap dengan penanganan error), jelaskan arsitektur secara singkat, dan gunakan blok kode Markdown dengan penanda bahasa yang tepat.`,
   },
 };
 
@@ -3244,14 +3254,14 @@ app.post(
           res.write(
             `data: ${JSON.stringify({
               type: "status",
-              text: "Sedang merender visual...",
+              text: "Merender gambar...",
             })}\n\n`
           );
 
           const imgResult = await generateMediaImage(userContent);
           const cleanedSubj = cleanUserPrompt(userContent) || "Gambar Visual";
 
-          aiResponseText = `Berikut visualisasi untuk permintaan Anda:\n\n![${cleanedSubj}](${imgResult.url})\n\n> *${imgResult.enhancedPrompt}*`;
+          aiResponseText = `Berikut visualisasi untuk permintaan Anda:\n\n![${cleanedSubj}](${imgResult.url})`;
 
           res.write(
             `data: ${JSON.stringify({
@@ -3263,11 +3273,11 @@ app.post(
           const imgResult = await generateMediaImage(userContent);
           const cleanedSubj = cleanUserPrompt(userContent) || "Gambar Visual";
 
-          aiResponseText = `Berikut visualisasi untuk permintaan Anda:\n\n![${cleanedSubj}](${imgResult.url})\n\n> *${imgResult.enhancedPrompt}*`;
+          aiResponseText = `Berikut visualisasi untuk permintaan Anda:\n\n![${cleanedSubj}](${imgResult.url})`;
         }
       } else if (isVideoRequest && userContent) {
         log.info(`STEP3 Media Intent: VIDEO generation for prompt="${userContent.slice(0, 50)}..."`);
-        modelUsed = "gemini-veo-2";
+        modelUsed = "axioma-video-engine";
         if (wantsStream) {
           if (!sseStarted && !res.headersSent) {
             sseStarted = true;
@@ -3294,7 +3304,7 @@ app.post(
           res.write(
             `data: ${JSON.stringify({
               type: "status",
-              text: "Sedang merender adegan video...",
+              text: "Merender video...",
             })}\n\n`
           );
 
@@ -3302,7 +3312,7 @@ app.post(
           const cleanedSubj = cleanUserPrompt(userContent) || "Adegan Video";
           const videoUrl = videoResult.videoUrl || "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4";
 
-          aiResponseText = `Berikut video yang telah selesai dirender:\n\n![video:${cleanedSubj}](${videoUrl})\n\n> *${videoResult.enhancedPrompt}*`;
+          aiResponseText = `Berikut visualisasi untuk permintaan Anda:\n\n![video:${cleanedSubj}](${videoUrl})`;
 
           res.write(
             `data: ${JSON.stringify({
@@ -3315,7 +3325,7 @@ app.post(
           const cleanedSubj = cleanUserPrompt(userContent) || "Adegan Video";
           const videoUrl = videoResult.videoUrl || "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4";
 
-          aiResponseText = `Berikut video yang telah selesai dirender:\n\n![video:${cleanedSubj}](${videoUrl})\n\n> *${videoResult.enhancedPrompt}*`;
+          aiResponseText = `Berikut visualisasi untuk permintaan Anda:\n\n![video:${cleanedSubj}](${videoUrl})`;
         }
       } else {
         try {
