@@ -3260,7 +3260,10 @@ app.post(
           );
 
           const imgResult = await generateMediaImage(userContent);
-          const cleanedSubj = cleanUserPrompt(userContent) || "Gambar Visual";
+          const cleanedSubj =
+            (cleanUserPrompt(userContent) || "Gambar Visual")
+              .replace(/[\r\n\[\]]+/g, " ")
+              .trim() || "Gambar Visual";
 
           aiResponseText = `Berikut visualisasi untuk permintaan Anda:\n\n![${cleanedSubj}](${imgResult.url})`;
 
@@ -3272,7 +3275,10 @@ app.post(
           );
         } else {
           const imgResult = await generateMediaImage(userContent);
-          const cleanedSubj = cleanUserPrompt(userContent) || "Gambar Visual";
+          const cleanedSubj =
+            (cleanUserPrompt(userContent) || "Gambar Visual")
+              .replace(/[\r\n\[\]]+/g, " ")
+              .trim() || "Gambar Visual";
 
           aiResponseText = `Berikut visualisasi untuk permintaan Anda:\n\n![${cleanedSubj}](${imgResult.url})`;
         }

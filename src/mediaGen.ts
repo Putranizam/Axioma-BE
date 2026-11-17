@@ -237,9 +237,10 @@ export async function generateMediaImage(userPrompt: string): Promise<GeneratedI
     .join(" ");
   const cleanPrompt = rawWords || "beautiful world aesthetic photography";
   const seed = Math.floor(Math.random() * 1000000);
-  const fluxUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(
-    cleanPrompt
-  )}?width=1024&height=1024&seed=${seed}&nologo=true&model=flux`;
+  const encodedPrompt = encodeURIComponent(cleanPrompt)
+    .replace(/\(/g, "%28")
+    .replace(/\)/g, "%29");
+  const fluxUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?width=1024&height=1024&seed=${seed}&nologo=true&model=flux`;
 
   return {
     url: fluxUrl,
