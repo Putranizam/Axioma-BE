@@ -388,7 +388,8 @@ ATURAN MUTLAK:
 1. JANGAN PERNAH menyebut dirimu sebagai AI, model bahasa besar (LLM), kecerdasan buatan, atau buatan Google/Gemini/OpenAI.
 2. JANGAN PERNAH menyebut nama produk pihak ketiga seperti Midjourney, DALL-E, Stable Diffusion, Gemini, ChatGPT, Claude, Flux, atau Veo dalam percakapan kecuali pengguna yang bertanya secara spesifik tentang produk tersebut. Seluruh kemampuan visual, analisis, komputasi, dan penalaran adalah teknologi asli buatan Axioma sendiri.
 3. Gunakan gaya bahasa Indonesia yang natural, langsung pada inti persoalan, cerdas, hangat, dan tidak kaku seperti robot.
-4. Jika pengguna meminta pembuatan gambar atau visual, langsung proses visualnya tanpa pernah menyuruh pengguna menggunakan aplikasi lain atau menawarkan pembuatan teks prompt.`;
+4. Jika pengguna meminta pembuatan gambar atau visual, langsung proses visualnya tanpa pernah menyuruh pengguna menggunakan aplikasi lain atau menawarkan pembuatan teks prompt.
+5. Jika pengguna bertanya tentang Axioma, "Tentang Kami", atau siapa pembuat/pencipta/pengembang aplikasi ini, jawablah secara natural dan profesional bahwa Axioma dirancang dan dikembangkan oleh Muhammad Nizam Putra Rasya dan Muhammad Rendy Ramadhani.`;
 
 export const AGENT_PROFILES: Record<AgentId, AgentProfile> = {
   "axioma-pro": {
@@ -2567,9 +2568,9 @@ app.post(
   }
 );
 
-// Voice Endpoint 2: POST /api/voice/speak (Text-To-Speech)
+// Voice Endpoint 2: POST /api/voice/speak & /api/tts (Text-To-Speech)
 app.post(
-  "/api/voice/speak",
+  ["/api/voice/speak", "/api/tts"],
   express.json({ limit: "100kb" }),
   async (req: Request, res: Response) => {
     const requestId = randomUUID().slice(0, 8);
@@ -3330,7 +3331,7 @@ app.post(
       } else {
         try {
           const voiceInstruction = req.body?.voice_mode
-            ? "MODE PERCAKAPAN SUARA (VOICE MODE): Anda sedang berbicara secara lisan langsung dengan pengguna. Jawab dengan SANGAT RINGKAS (1-3 kalimat saja), luwes, santai, dan alami seperti percakapan lisan manusia sehari-hari. DILARANG KERAS menggunakan format markdown (seperti *, **, #, `), poin angka/bullet, emotikon berlebihan, blok kode, URL, atau tabel, karena jawaban ini akan langsung disuarakan dengan Text-To-Speech."
+            ? "MODE PERCAKAPAN SUARA (VOICE MODE): Anda sedang berbicara secara lisan langsung dengan pengguna dalam percakapan suara dua arah. Jawab dengan gaya bahasa lisan Bahasa Indonesia yang natural, hangat, langsung ke inti, dan ringkas (2–4 kalimat per giliran). DILARANG KERAS menggunakan format markdown (seperti *, **, #, `), poin angka/bullet, emotikon berlebihan, blok kode panjang, URL, atau tabel, karena jawaban ini akan langsung disuarakan dengan Text-To-Speech."
             : undefined;
 
           if (wantsStream) {
