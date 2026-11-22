@@ -40,6 +40,11 @@ import {
   generateMediaVideo,
   cleanUserPrompt,
 } from "./mediaGen";
+import {
+  resolveEngine,
+  getPublicEngineList,
+  isThinkingCapableModel,
+} from "./config/engineConfig";
 
 const app = express();
 const PORT = process.env.PORT || 8000;
@@ -91,7 +96,7 @@ function parseSentryDsn(dsn: string): { endpoint: string; publicKey: string } | 
   }
 }
 
-export function reportCentralizedError(err: unknown, context: ErrorReportContext = {}): void {
+export function reportCentralizedError(err: unknown, context:ErrorReportContext = {}): void {
   const errorObj = err instanceof Error ? err : new Error(String(err));
   const payload = {
     level: "error",
@@ -396,7 +401,11 @@ export const AGENT_PROFILES: Record<AgentId, AgentProfile> = {
     id: "axioma-pro",
     label: "Axioma Pro",
     shortName: "Axioma Pro",
-    modelChain: getModelChain(),
+    modelChain: resolveEngine({
+      requestedMode: "pro",
+      taskType: "chat_deep",
+      agentId: "axioma-pro",
+    }).modelChain,
     temperature: 0.4,
     systemInstruction: `${CORE_AXIOMA_SYSTEM_INSTRUCTION}
 
@@ -406,7 +415,11 @@ Kamu adalah Axioma Pro, asisten analitis tingkat lanjut untuk penalaran mendalam
     id: "axioma-omni",
     label: "Axioma Omni",
     shortName: "Axioma Omni",
-    modelChain: getModelChain(),
+    modelChain: resolveEngine({
+      requestedMode: "fast",
+      taskType: "chat",
+      agentId: "axioma-omni",
+    }).modelChain,
     temperature: 0.7,
     systemInstruction: `${CORE_AXIOMA_SYSTEM_INSTRUCTION}
 
@@ -416,7 +429,11 @@ Kamu adalah Axioma Omni, asisten serbaguna yang cepat, adaptif, dan komunikatif 
     id: "axioma-architect",
     label: "Axioma Architect",
     shortName: "Axioma Architect",
-    modelChain: getModelChain(),
+    modelChain: resolveEngine({
+      requestedMode: "pro",
+      taskType: "chat_deep",
+      agentId: "axioma-architect",
+    }).modelChain,
     temperature: 0.2,
     systemInstruction: `${CORE_AXIOMA_SYSTEM_INSTRUCTION}
 
@@ -437,10 +454,7 @@ function getModelInstance(
   profile: AgentProfile,
   extraInstruction?: string
 ) {
-  const isThinkingCapable =
-    modelName === "gemini-3-flash-preview" ||
-    modelName.includes("preview") ||
-    modelName.includes("thinking");
+  const isThinkingCapable = isThinkingCapableModel(modelName);
   const generationConfig: Record<string, any> = {
     temperature: profile.temperature,
   };
@@ -954,6 +968,12 @@ interface SendMessageRequest {
   stream?: boolean;
   user_id?: string;
   agent_id?: string;
+  engine_mode?: string;
+  engineMode?: string;
+  thinking_mode?: string;
+  thinkingMode?: string;
+  task_type?: string;
+  taskType?: string;
   regenerate?: boolean;
   turnstile_token?: string;
   attachment_ids?: string[];
@@ -1264,7 +1284,8 @@ async function generateWithFallbackAndRetry(
   log: Logger,
   agentProfile: AgentProfile,
   onChunk?: (chunkText: string) => void,
-  extraInstruction?: string
+  extraInstruction?: string,
+  overrideModelChain?: readonly string[]
 ): Promise<{
   text: string;
   modelUsed: string;
@@ -1282,12 +1303,17 @@ async function generateWithFallbackAndRetry(
   let fallbackOverheadMs = 0;
   const attempts: AiAttemptLog[] = [];
 
+  const activeChain =
+    overrideModelChain && overrideModelChain.length > 0
+      ? overrideModelChain
+      : agentProfile.modelChain;
+
   // Prioritize models that are not currently in a 429/timeout cooldown (#7, #9)
   const now = Date.now();
-  const availableModels = agentProfile.modelChain.filter(
+  const availableModels = activeChain.filter(
     (m) => (modelCooldownUntil.get(m) || 0) <= now
   );
-  const cooledDownModels = agentProfile.modelChain.filter(
+  const cooledDownModels = activeChain.filter(
     (m) => (modelCooldownUntil.get(m) || 0) > now
   );
   const orderedChain = [...availableModels, ...cooledDownModels];
@@ -1700,6 +1726,17 @@ app.get("/health", handleHealthCheck);
 // Lightweight warmup endpoint: returns { ok: true } instantly without DB access (#1)
 app.get("/api/health", (_req: Request, res: Response) => {
   return res.status(200).json({ ok: true });
+});
+
+// Dynamic AI Engine Catalog Endpoint: GET /api/engines
+app.get("/api/engines", (_req: Request, res: Response) => {
+  const engines = getPublicEngineList();
+  const defaultEngine = engines.find((e) => e.isDefault)?.id || "auto";
+  return res.status(200).json({
+    success: true,
+    defaultEngine,
+    engines,
+  });
 });
 
 // 6a. List User's Chats: GET /api/chats (#2, #3)
@@ -3216,11 +3253,35 @@ app.post(
       const promptText = userContent || "Analisis dan jelaskan isi berkas yang dilampirkan oleh pengguna.";
       const geminiContents = buildNormalizedGeminiContents(historyRows, promptText, latestAttachmentParts);
 
-      // Step 3: Generate response using Gemini API with a pre-assigned UUID for the AI message (#3, #4)
+      // Resolve AI Engine dynamically per request (auto | fast | pro) with automatic fallback
+      const requestedEngineMode =
+        (typeof req.body?.engine_mode === "string" && req.body.engine_mode.trim()) ||
+        (typeof req.body?.engineMode === "string" && req.body.engineMode.trim()) ||
+        "auto";
+      const requestedThinkingMode =
+        (typeof req.body?.thinking_mode === "string" && req.body.thinking_mode.trim()) ||
+        (typeof req.body?.thinkingMode === "string" && req.body.thinkingMode.trim()) ||
+        undefined;
+      const requestedTaskType =
+        (typeof req.body?.task_type === "string" && req.body.task_type.trim()) ||
+        (typeof req.body?.taskType === "string" && req.body.taskType.trim()) ||
+        "chat";
+      const resolvedEngine = resolveEngine({
+        requestedMode: requestedEngineMode,
+        taskType: requestedTaskType,
+        hasAttachment: rawAttachmentIds.length > 0 || latestAttachmentParts.length > 0,
+        thinkingMode: requestedThinkingMode,
+        agentId: agentProfile.id,
+      });
+      stageTimings.engine_mode = resolvedEngine.selectedMode;
+      stageTimings.engine_tier = resolvedEngine.resolvedTier;
+      stageTimings.engine_reason = resolvedEngine.reason;
+
+      // Step 3: Generate response using resolved AI Engine with a pre-assigned UUID for the AI message (#3, #4)
       const preGeneratedAiMsgId = randomUUID();
       let aiResponseText = "";
       let streamedTextSoFar = "";
-      let modelUsed: string = agentProfile.modelChain[0];
+      let modelUsed: string = resolvedEngine.primaryModel;
 
       // Check for Media Generation Intent (Image or Video)
       const isImageRequest = (req.body as any)?.media_mode === "image" || detectImageGenerationIntent(userContent);
@@ -3228,7 +3289,7 @@ app.post(
 
       if (isImageRequest && userContent) {
         log.info(`STEP3 Media Intent: IMAGE generation for prompt="${userContent.slice(0, 50)}..."`);
-        modelUsed = "gemini-imagen-flux";
+        modelUsed = "axioma-visual-engine";
         if (wantsStream) {
           if (!sseStarted && !res.headersSent) {
             sseStarted = true;
@@ -3380,7 +3441,8 @@ app.post(
                   res.write(`data: ${JSON.stringify({ type: "chunk", text: chunkText })}\n\n`);
                 }
               },
-              voiceInstruction
+              voiceInstruction,
+              resolvedEngine.modelChain
             );
             aiResponseText = result.text;
             modelUsed = result.modelUsed;
@@ -3398,7 +3460,8 @@ app.post(
               log,
               agentProfile,
               undefined,
-              voiceInstruction
+              voiceInstruction,
+              resolvedEngine.modelChain
             );
             aiResponseText = result.text;
             modelUsed = result.modelUsed;

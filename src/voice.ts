@@ -1,5 +1,6 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { callGeminiWithFallback } from "./geminiModels";
+import { resolveEngine } from "./config/engineConfig";
 
 export function stripMarkdownForTts(text: string): string {
   if (!text) return "";
@@ -229,6 +230,10 @@ export async function transcribeAudio(
       return response.response.text();
     },
     {
+      customChain: resolveEngine({
+        requestedMode: "auto",
+        taskType: "voice_transcription",
+      }).modelChain,
       purpose: "voice_transcription",
       timeoutMs: 15_000,
     }

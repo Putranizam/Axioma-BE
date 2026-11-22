@@ -1,5 +1,6 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { callGeminiWithFallback } from "./geminiModels";
+import { getMediaEngineConfig, resolveEngine } from "./config/engineConfig";
 
 const geminiApiKey = process.env.GEMINI_API_KEY || "";
 const genAI = geminiApiKey ? new GoogleGenerativeAI(geminiApiKey) : null;
@@ -156,6 +157,7 @@ RULES:
         return text.replace(/^["'`]+|["'`]+$/g, "").trim();
       },
       {
+        customChain: resolveEngine({ requestedMode: "auto", taskType: "media_prompt" }).modelChain,
         purpose: `media-prompt-enhancement-${mediaType}`,
         timeoutMs: 8_000,
       }
@@ -179,10 +181,13 @@ RULES:
 export async function generateMediaImage(userPrompt: string): Promise<GeneratedImageResult> {
   const enhancedPrompt = await enhancePrompt(userPrompt, "image");
 
-  // 1. Try Google Imagen 3 Predict API if API key is configured
+  // 1. Try Google Imagen Predict API if API key is configured (model driven by ENGINE_IMAGE)
   if (geminiApiKey) {
     try {
-      const imagenUrl = `https://generativelanguage.googleapis.com/v1beta/models/imagen-3.0-generate-002:predict?key=${geminiApiKey}`;
+      const { imageModel } = getMediaEngineConfig();
+      const imagenUrl = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+        imageModel
+      )}:predict?key=${geminiApiKey}`;
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 12_000);
 
@@ -316,10 +321,13 @@ export async function generateMediaVideo(userPrompt: string): Promise<GeneratedV
   const enhancedPrompt = await enhancePrompt(userPrompt, "video");
   const cleaned = cleanUserPrompt(userPrompt);
 
-  // 1. If Gemini API key is configured, try Google Veo 2 predictLongRunning
+  // 1. If Gemini API key is configured, try Google Veo predictLongRunning (model driven by ENGINE_VIDEO)
   if (geminiApiKey) {
     try {
-      const veoUrl = `https://generativelanguage.googleapis.com/v1beta/models/veo-2.0-generate-001:predictLongRunning?key=${geminiApiKey}`;
+      const { videoModel } = getMediaEngineConfig();
+      const veoUrl = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+        videoModel
+      )}:predictLongRunning?key=${geminiApiKey}`;
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 10_000);
 
