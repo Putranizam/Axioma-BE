@@ -293,23 +293,30 @@ const configuredOrigins = rawConfiguredOrigins
   .map((o) => o.trim().replace(/\/+$/, ""))
   .filter(Boolean);
 
-// Origin resmi frontend produksi & lokal
+// Origin resmi frontend produksi (localhost/127.0.0.1 hanya diizinkan di luar produksi)
 const defaultProductionOrigins = [
   "https://axioma.my.id",
   "https://www.axioma.my.id",
   "https://axioma-fe.vercel.app",
-  "https://axioma.id",
-  "https://www.axioma.id",
-  "http://localhost:3000",
-  "http://localhost:3001",
-  "http://127.0.0.1:3000",
-  "http://127.0.0.1:3001",
 ];
+
+const devLocalOrigins = !IS_PRODUCTION
+  ? [
+      "http://localhost:3000",
+      "http://localhost:3001",
+      "http://127.0.0.1:3000",
+      "http://127.0.0.1:3001",
+    ]
+  : [];
 
 const allowedOrigins = new Set<string>([
   ...defaultProductionOrigins,
+  ...devLocalOrigins,
   ...configuredOrigins,
 ]);
+
+// Strict Vercel preview allowlist: only official Axioma frontend deployment subdomains
+const AXIOMA_VERCEL_ORIGIN_REGEX = /^https:\/\/axioma-fe(?:-[a-z0-9-]+)?\.vercel\.app$/i;
 
 const corsOptions: cors.CorsOptions = {
   origin: (origin, callback) => {
@@ -319,8 +326,7 @@ const corsOptions: cors.CorsOptions = {
     const normalized = origin.trim().replace(/\/+$/, "");
     if (
       normalized.toLowerCase() !== "null" &&
-      (allowedOrigins.has(normalized) ||
-        (normalized.endsWith(".vercel.app") && normalized.includes("axioma")))
+      (allowedOrigins.has(normalized) || AXIOMA_VERCEL_ORIGIN_REGEX.test(normalized))
     ) {
       return callback(null, normalized);
     }
@@ -613,6 +619,7 @@ function setBoundedMapEntry<K, V>(
 // Sliding-window rate limiters: enforced per User ID AND per Client IP (#3)
 const userRateWindowMap = new Map<string, number[]>();
 const ipRateWindowMap = new Map<string, number[]>();
+const voiceRateWindowMap = new Map<string, number[]>();
 
 function evaluateSlidingWindow(
   store: Map<string, number[]>,
@@ -998,19 +1005,9 @@ function recordGeminiCallAttempt(): void {
     });
 }
 
-// In-memory pre-migration fallback maps only (NO local disk JSON state — all persistent state lives in Supabase DB) (#1)
-const chatOwnerMap = new Map<string, string>([
-  ["c473cf9d-515c-4b62-9788-f9535405afc1", "2bd9c62b-6793-40e7-b0ca-77b03c625a37"],
-  ["b71d233e-2335-4558-b67f-cd1fedecc251", "2bd9c62b-6793-40e7-b0ca-77b03c625a37"],
-  ["642caa85-3a55-483c-b863-cc657f35ca2b", "2bd9c62b-6793-40e7-b0ca-77b03c625a37"],
-  ["a19114a6-eb7d-48c3-ac29-e07c2aa7acef", "2bd9c62b-6793-40e7-b0ca-77b03c625a37"],
-]);
-const messageAgentMap = new Map<string, { agent_id: string; agent_name: string }>([
-  [
-    "f63179a3-50b7-4a8f-a3e0-0f2345055f4e",
-    { agent_id: "axioma-omni", agent_name: "Axioma Omni" },
-  ],
-]);
+// In-memory pre-migration fallback maps only (NO hardcoded UUIDs, NO local disk JSON state) (#1)
+const chatOwnerMap = new Map<string, string>();
+const messageAgentMap = new Map<string, { agent_id: string; agent_name: string }>();
 const inMemoryFeedbackFallback = new Map<string, FeedbackEntry>();
 
 function recordChatOwner(chatId: string, userId: string): void {
@@ -1274,6 +1271,7 @@ function cleanupInMemoryCaches(): void {
   const now = Date.now();
   sweepRateWindowMap(userRateWindowMap, RATE_LIMIT_WINDOW_MS, now);
   sweepRateWindowMap(ipRateWindowMap, RATE_LIMIT_WINDOW_MS, now);
+  sweepRateWindowMap(voiceRateWindowMap, RATE_LIMIT_WINDOW_MS, now);
   sweepRateWindowMap(uploadIpRateWindowMap, RATE_LIMIT_UPLOAD_WINDOW_MS, now);
   sweepRateWindowMap(uploadUserRateWindowMap, RATE_LIMIT_UPLOAD_WINDOW_MS, now);
 
@@ -2124,7 +2122,8 @@ const handleHealthCheck = async (req: Request, res: Response) => {
 app.get("/", (_req: Request, res: Response) => {
   return res.status(200).json({
     status: "ok",
-    message: "Axioma backend-dev running",
+    service: "Axioma API",
+    env: IS_PRODUCTION ? "production" : "development",
   });
 });
 
@@ -2961,7 +2960,7 @@ const handleVoiceUpload = (req: Request, res: Response, next: NextFunction) => {
   });
 };
 
-const voiceRateWindowMap = new Map<string, number[]>();
+// voiceRateWindowMap declared & cleaned up alongside sliding-window rate limiters above
 
 function checkVoiceRateLimits(
   userId: string,
@@ -3716,14 +3715,15 @@ app.post(
 );
 
 // 6b-6. Structured Response Feedback Endpoint: POST /api/chat/feedback (and alias /api/chats/feedback)
+// Persists directly into Supabase `public.message_feedback` (no blocking local disk writes).
 app.post(
   ["/api/chat/feedback", "/api/chats/feedback"],
   express.json({ limit: "64kb" }),
-  (req: Request, res: Response) => {
+  async (req: Request, res: Response) => {
     const requestId = randomUUID().slice(0, 8);
     const log = createLogger(requestId);
 
-    const { chatId, messageId, rating, reason, note, meta } = req.body || {};
+    const { chatId, messageId, rating, reason, note } = req.body || {};
     if (rating !== "up" && rating !== "down") {
       return res.status(400).json({
         success: false,
@@ -3732,38 +3732,141 @@ app.post(
       });
     }
 
-    const entry = {
-      timestamp: new Date().toISOString(),
-      requestId,
-      chatId: typeof chatId === "string" ? chatId.trim().slice(0, 128) : undefined,
-      messageId: typeof messageId === "string" ? messageId.trim().slice(0, 128) : undefined,
-      rating,
-      reason: typeof reason === "string" ? reason.trim().slice(0, 200) : undefined,
-      note: typeof note === "string" ? note.trim().slice(0, 1000) : undefined,
-      meta:
-        meta && typeof meta === "object" && !Array.isArray(meta)
-          ? (meta as Record<string, unknown>)
-          : undefined,
-    };
+    const cleanChatId = typeof chatId === "string" ? chatId.trim() : "";
+    const cleanMessageId = typeof messageId === "string" ? messageId.trim() : "";
+    const cleanReason = typeof reason === "string" ? reason.trim().slice(0, 200) : "";
+    const cleanNote = typeof note === "string" ? note.trim().slice(0, 1000) : "";
+    const combinedComment = [cleanReason, cleanNote].filter(Boolean).join(" — ").slice(0, 1000) || null;
 
     try {
-      const logsDir = path.join(process.cwd(), "logs");
-      fs.mkdirSync(logsDir, { recursive: true });
-      fs.appendFileSync(
-        path.join(logsDir, "feedback.jsonl"),
-        `${JSON.stringify(entry)}\n`,
-        "utf8"
+      const { user } = await resolveRequestUser(req, log);
+      const effectiveUserId = user?.id || `anon-${requestId}`;
+      const updatedAt = new Date().toISOString();
+
+      if (UUID_REGEX.test(cleanMessageId)) {
+        const { error: dbError } = await supabase.from("message_feedback").upsert(
+          {
+            message_id: cleanMessageId,
+            chat_id: UUID_REGEX.test(cleanChatId) ? cleanChatId : null,
+            user_id: effectiveUserId,
+            rating,
+            comment: combinedComment,
+            updated_at: updatedAt,
+          },
+          { onConflict: "message_id" }
+        );
+
+        if (dbError) {
+          log.error(`POST /api/chat/feedback Supabase upsert error: ${dbError.message}`);
+          return res.status(500).json({
+            success: false,
+            code: "feedback_save_failed",
+            error: "Gagal menyimpan masukan balasan ke database.",
+          });
+        }
+      }
+
+      log.info(
+        `[STRUCTURED_FEEDBACK] messageId=${cleanMessageId || "n/a"} rating=${rating} reason=${cleanReason || "none"}`
       );
-    } catch (fsErr: any) {
-      log.warn(`Feedback file append skipped (fallback to stdout): ${fsErr?.message || fsErr}`);
+
+      return res.status(200).json({
+        status: "ok",
+        success: true,
+      });
+    } catch (err: any) {
+      log.error("POST /api/chat/feedback unexpected error", err);
+      return res.status(500).json({
+        success: false,
+        code: "feedback_save_failed",
+        error: "Terjadi kendala saat menyimpan masukan balasan.",
+      });
+    }
+  }
+);
+
+// 6b-6b. General App Feedback Endpoint (Setelan -> Kirim Masukan): POST /api/feedback
+app.post(
+  "/api/feedback",
+  express.json({ limit: "32kb" }),
+  async (req: Request, res: Response) => {
+    const requestId = randomUUID().slice(0, 8);
+    const log = createLogger(requestId);
+    const clientIp = getClientIp(req);
+
+    const body = (req.body || {}) as Record<string, unknown>;
+    const cleanCategory =
+      typeof body.category === "string" && body.category.trim()
+        ? body.category.trim().slice(0, 60)
+        : "Lainnya";
+    const cleanMessage =
+      typeof body.message === "string" ? body.message.trim().slice(0, 4000) : "";
+    const cleanEmail =
+      typeof body.userEmail === "string" && body.userEmail.trim()
+        ? body.userEmail.trim().slice(0, 160)
+        : null;
+    const cleanName =
+      typeof body.userName === "string" && body.userName.trim()
+        ? body.userName.trim().slice(0, 80)
+        : "Mode Tamu";
+    const cleanDevice =
+      typeof body.deviceInfo === "string" && body.deviceInfo.trim()
+        ? body.deviceInfo.trim().slice(0, 300)
+        : null;
+
+    if (!cleanMessage || cleanMessage.length < 3) {
+      return res.status(400).json({
+        success: false,
+        code: "message_too_short",
+        error: "Pesan masukan tidak boleh kosong (minimal 3 karakter).",
+      });
     }
 
-    log.info(`[STRUCTURED_FEEDBACK] ${JSON.stringify(entry)}`);
+    try {
+      const { user } = await resolveRequestUser(req, log);
+      const { data: inserted, error: insertError } = await supabase
+        .from("app_feedback")
+        .insert({
+          user_id: user?.authenticated ? user.id : null,
+          category: cleanCategory,
+          message: cleanMessage,
+          user_name: cleanName,
+          user_email: cleanEmail,
+          device_info: cleanDevice,
+          client_ip: clientIp && clientIp !== "unknown" ? clientIp : null,
+        })
+        .select("id, created_at")
+        .maybeSingle();
 
-    return res.status(200).json({
-      status: "ok",
-      success: true,
-    });
+      if (insertError) {
+        log.error(`POST /api/feedback Supabase insert error: ${insertError.message}`);
+        return res.status(500).json({
+          success: false,
+          code: "feedback_save_failed",
+          error: "Gagal menyimpan masukan ke database. Silakan coba lagi nanti.",
+        });
+      }
+
+      log.info(
+        `[APP_FEEDBACK] saved id=${inserted?.id || "ok"} category=${cleanCategory} user=${
+          user?.authenticated ? user.id : "guest"
+        }`
+      );
+
+      return res.status(201).json({
+        success: true,
+        id: inserted?.id || null,
+        created_at: inserted?.created_at || new Date().toISOString(),
+        message: "Terima kasih! Masukan Anda telah diterima.",
+      });
+    } catch (err: any) {
+      log.error("POST /api/feedback unexpected error", err);
+      return res.status(500).json({
+        success: false,
+        code: "feedback_save_failed",
+        error: "Terjadi kendala saat menyimpan masukan. Silakan coba lagi.",
+      });
+    }
   }
 );
 
@@ -4994,6 +5097,8 @@ app.post(
         created_at: string;
       }> = [];
       let userRemainingCredits: number | undefined;
+      let userDailyCredits: number | undefined;
+      let userBonusCredits: number | undefined;
 
       // Run Turnstile verification, quota prefetch, chat ownership lookup, and latest 24-message history in parallel
       log.info("STEP1 parallel preflight: Turnstile + quota + chat + recent history");
@@ -5113,6 +5218,8 @@ app.post(
             });
           }
           userRemainingCredits = quotaCheck.remaining;
+          userDailyCredits = quotaCheck.dailyCredits;
+          userBonusCredits = quotaCheck.bonusCredits;
         }
 
         chatTitle = existingChat?.title || DEFAULT_CHAT_TITLE;
@@ -5497,44 +5604,55 @@ app.post(
           strictPrompt = userContent;
         }
 
-        // 2. Generate video with safe error handling so SSE/JSON contract is never broken abruptly
+        // 2. Generate video cleanly without unrelated static placeholder fallback
         resetWatchdog(REQUEST_WATCHDOG_MS);
         try {
           const videoResult = await generateMediaVideo(userContent, strictPrompt);
-          const videoUrl =
-            videoResult?.videoUrl ||
-            "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4";
+          const videoUrl = videoResult?.videoUrl?.trim() || "";
           mediaRevisedPrompt = videoResult?.revisedPrompt || strictPrompt;
-          mediaVideoUrl = videoUrl;
-          mediaResultType = "video";
           const cleanedSubj =
             (cleanUserPrompt(userContent) || "Adegan Video")
               .replace(/[\r\n\[\]]+/g, " ")
               .trim() || "Adegan Video";
-          mediaResultTitle = cleanedSubj;
 
-          aiResponseText = `Berikut visualisasi untuk permintaan Anda:\n\n![video:${cleanedSubj}](${videoUrl})`;
+          if (videoUrl) {
+            mediaVideoUrl = videoUrl;
+            mediaResultType = "video";
+            mediaResultTitle = cleanedSubj;
+            aiResponseText = `Berikut visualisasi untuk permintaan Anda:\n\n![video:${cleanedSubj}](${videoUrl})`;
 
-          if (wantsStream) {
-            writeSseEvent({
-              type: "video",
-              mediaType: "video",
-              videoUrl,
-              url: videoUrl,
-              mediaTitle: cleanedSubj,
-              revisedPrompt: mediaRevisedPrompt,
-              ai_message_id: preGeneratedAiMsgId,
-              message_id: preGeneratedAiMsgId,
-            });
-            writeSseEvent({
-              type: "chunk",
-              text: aiResponseText,
-              videoUrl,
-              mediaType: "video",
-              mediaTitle: cleanedSubj,
-              revisedPrompt: mediaRevisedPrompt,
-              ai_message_id: preGeneratedAiMsgId,
-            });
+            if (wantsStream) {
+              writeSseEvent({
+                type: "video",
+                mediaType: "video",
+                videoUrl,
+                url: videoUrl,
+                mediaTitle: cleanedSubj,
+                revisedPrompt: mediaRevisedPrompt,
+                ai_message_id: preGeneratedAiMsgId,
+                message_id: preGeneratedAiMsgId,
+              });
+              writeSseEvent({
+                type: "chunk",
+                text: aiResponseText,
+                videoUrl,
+                mediaType: "video",
+                mediaTitle: cleanedSubj,
+                revisedPrompt: mediaRevisedPrompt,
+                ai_message_id: preGeneratedAiMsgId,
+              });
+            }
+          } else {
+            aiResponseText =
+              videoResult?.message ||
+              "Maaf, belum ditemukan video yang cocok dengan permintaan Anda. Coba jelaskan adegan secara lebih spesifik.";
+            if (wantsStream) {
+              writeSseEvent({
+                type: "chunk",
+                text: aiResponseText,
+                ai_message_id: preGeneratedAiMsgId,
+              });
+            }
           }
         } catch (mediaErr: any) {
           console.error("[POST /api/chats/message] generateMediaVideo failed:", mediaErr);
@@ -5784,6 +5902,12 @@ app.post(
         ...(mediaRevisedPrompt ? { revisedPrompt: mediaRevisedPrompt } : {}),
         ...(typeof userRemainingCredits === "number"
           ? { remainingCredits: userRemainingCredits }
+          : {}),
+        ...(typeof userDailyCredits === "number"
+          ? { dailyCredits: userDailyCredits }
+          : {}),
+        ...(typeof userBonusCredits === "number"
+          ? { bonusCredits: userBonusCredits }
           : {}),
       };
 

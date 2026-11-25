@@ -32,14 +32,14 @@ export interface GeneratedImageResult {
 }
 
 export interface GeneratedVideoResult {
-  status: "completed" | "billing_required" | "pending";
+  status: "completed" | "billing_required" | "pending" | "not_found";
   videoUrl?: string;
   operationName?: string;
   enhancedPrompt: string;
   revisedPrompt: string;
   originalPrompt: string;
   searchKeywords?: string;
-  provider?: "veo-2" | "pexels" | "pixabay" | "wikimedia" | "fallback";
+  provider?: "veo-2" | "pexels" | "pixabay" | "wikimedia";
   message: string;
 }
 
@@ -416,8 +416,8 @@ async function searchWikimediaVideo(query: string): Promise<string | null> {
 async function fetchRelevantStockVideo(keywords: string[]): Promise<{
   url: string;
   matchedQuery: string;
-  provider: "pexels" | "pixabay" | "wikimedia" | "fallback";
-}> {
+  provider: "pexels" | "pixabay" | "wikimedia";
+} | null> {
   const uniqueKw = Array.from(new Set(keywords.map((k) => k.trim().toLowerCase()).filter(Boolean)));
   const queriesToTry: string[] = [];
 
@@ -465,15 +465,11 @@ async function fetchRelevantStockVideo(keywords: string[]): Promise<{
     }
   }
 
-  // 4. Last-resort safe fallback only after every progressive query returned zero results
+  // 4. Return null cleanly when every progressive query returned zero results (never serve an unrelated placeholder video)
   console.warn(
-    `[mediaGen] All progressive video queries returned 0 hits (${queriesToTry.join(" | ")}); using CC0 fallback.`
+    `[mediaGen] All progressive video queries returned 0 hits (${queriesToTry.join(" | ")}); returning null.`
   );
-  return {
-    url: "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4",
-    matchedQuery: queriesToTry[0] || "",
-    provider: "fallback",
-  };
+  return null;
 }
 
 /**
@@ -522,11 +518,11 @@ export async function generateMediaVideo(
           return {
             status: "pending",
             operationName: data.name,
-            videoUrl: previewStock.url,
+            videoUrl: previewStock?.url,
             enhancedPrompt: strictPrompt,
             revisedPrompt: strictPrompt,
             originalPrompt: userPrompt,
-            searchKeywords: previewStock.matchedQuery || searchKeywordsStr,
+            searchKeywords: previewStock?.matchedQuery || searchKeywordsStr,
             provider: "veo-2",
             message: "Video sinematik sedang dirender.",
           };
@@ -539,6 +535,18 @@ export async function generateMediaVideo(
 
   // 4. Progressive stock video match using extracted English keywords (4 -> 2 -> 1 keywords)
   const stockMatch = await fetchRelevantStockVideo(searchKeywordsArr);
+  if (!stockMatch) {
+    return {
+      status: "not_found",
+      videoUrl: undefined,
+      enhancedPrompt: strictPrompt,
+      revisedPrompt: strictPrompt,
+      originalPrompt: userPrompt,
+      searchKeywords: searchKeywordsStr,
+      message:
+        "Belum ditemukan video yang sesuai dengan permintaan Anda. Coba ubah atau perjelas deskripsi adegan.",
+    };
+  }
 
   return {
     status: "completed",
