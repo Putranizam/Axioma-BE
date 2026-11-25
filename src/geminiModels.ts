@@ -1,15 +1,22 @@
 /**
  * Centralized Gemini Model Fallback Chain & Execution Engine for Axioma
  *
- * Delegates all model selection and fallback ordering to `src/config/engineConfig.ts`
- * (driven by ENGINE_FAST, ENGINE_PRO, ENGINE_FALLBACK, and optional GEMINI_MODEL_CHAIN).
+ * Supports:
+ * - Environment variable override: GEMINI_MODEL_CHAIN="model1,model2,model3"
+ * - In-memory cooldown tracking for 429 (quota), 404 (deprecated/not found), 500, 503, timeouts
+ * - Unified callGeminiWithFallback helper for chat, voice transcription, and title generation
  */
 
-import {
-  getDefaultEngineChain,
-  resolveEngine,
-  ResolveEngineParams,
-} from "./config/engineConfig";
+export const DEFAULT_MODEL_CHAIN: readonly string[] = [
+  "gemini-flash-lite-latest",
+  "gemini-3.6-flash",
+  "gemini-3.1-flash-lite",
+  "gemini-3.5-flash-lite",
+  "gemini-3-flash-preview",
+  "gemini-3.5-flash",
+  "gemini-3.7-flash",
+  "gemini-3.8-flash",
+];
 
 // Cooldown durations
 export const COOLDOWN_DURATIONS = {
@@ -24,20 +31,23 @@ export const COOLDOWN_DURATIONS = {
 export const modelCooldownUntil = new Map<string, number>();
 
 /**
- * Returns the effective model chain from centralized engineConfig.
- * Can be overridden per-call via customChain or engine routing parameters.
+ * Returns the effective model chain.
+ * Can be overridden globally via process.env.GEMINI_MODEL_CHAIN
+ * or per-call via customChain.
  */
-export function getModelChain(
-  customChain?: readonly string[],
-  engineParams?: ResolveEngineParams
-): string[] {
+export function getModelChain(customChain?: readonly string[]): string[] {
   if (customChain && customChain.length > 0) {
     return [...customChain];
   }
-  if (engineParams) {
-    return resolveEngine(engineParams).modelChain;
+  const envChain = (process.env.GEMINI_MODEL_CHAIN || "").trim();
+  if (envChain) {
+    const parsed = envChain
+      .split(",")
+      .map((m) => m.trim())
+      .filter(Boolean);
+    if (parsed.length > 0) return parsed;
   }
-  return getDefaultEngineChain();
+  return [...DEFAULT_MODEL_CHAIN];
 }
 
 export const MODEL_CHAIN: string[] = getModelChain();
@@ -89,8 +99,13 @@ export function isRetryableGeminiError(err: any): boolean {
     "bad gateway",
     "503",
     "service unavailable",
+    "unavailable",
     "overloaded",
     "high demand",
+    "failed to parse stream",
+    "error reading from the stream",
+    "error parsing json response",
+    "terminated",
     "504",
     "gateway timeout",
     "timeout",
@@ -143,7 +158,6 @@ export interface FallbackAttemptLog {
 
 export interface FallbackOptions {
   customChain?: readonly string[];
-  engine?: ResolveEngineParams;
   timeoutMs?: number;
   abortSignal?: AbortSignal;
   purpose?: string;
@@ -167,7 +181,7 @@ export async function callGeminiWithFallback<T>(
   requestFn: (modelName: string, signal?: AbortSignal) => Promise<T>,
   options: FallbackOptions = {}
 ): Promise<FallbackResult<T>> {
-  const chain = getModelChain(options.customChain, options.engine);
+  const chain = getModelChain(options.customChain);
   const now = Date.now();
 
   // Prioritize models that are not in cooldown

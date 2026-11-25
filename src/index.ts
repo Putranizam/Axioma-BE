@@ -27,6 +27,7 @@ import {
 import { transcribeAudio, synthesizeSpeech } from "./voice";
 import {
   getModelChain,
+  callGeminiWithFallback,
   isRetryableGeminiError,
   isQuotaOrRateLimitError,
   isZeroQuotaError,
@@ -34,17 +35,81 @@ import {
   COOLDOWN_DURATIONS,
 } from "./geminiModels";
 import {
-  detectImageGenerationIntent,
-  detectVideoGenerationIntent,
   generateMediaImage,
   generateMediaVideo,
   cleanUserPrompt,
 } from "./mediaGen";
+import { detectDirectMediaIntent } from "./utils/mediaIntentDetector";
+import { buildStrictVisualPrompt } from "./utils/strictVisualPrompt";
+import { resolveQuotaModelKey } from "./config/quotaConfig";
 import {
-  resolveEngine,
-  getPublicEngineList,
-  isThinkingCapableModel,
-} from "./config/engineConfig";
+  bindQuotaSupabaseClient,
+  getUserQuota,
+  checkAndConsumeQuota,
+} from "./services/quotaService";
+import { axiomaRateLimiter } from "./middleware/rateLimiter";
+import {
+  buildSystemInstruction,
+  resolveLanguageCode,
+  resolveToneStyle,
+  LanguageCode,
+  ToneStyle,
+} from "./utils/promptBuilder";
+import {
+  AnswerStyle,
+  ThinkingMode,
+  SocialTarget,
+  ConversationCheckpoint,
+  WorkspaceContext,
+  DecisionJournalEntry,
+  ContextControl,
+  detectIntent,
+  resolveAnswerStyle,
+  resolveThinkingMode,
+  resolveSocialTarget,
+  shouldActivateSelfReview,
+  shouldActivateTaskBreakdown,
+  sanitizeCheckpoint,
+  hasUsableCheckpoint,
+  sanitizeWorkspaceContext,
+  sanitizeDecisionHistory,
+  sanitizeUserProfile,
+  sanitizeContextControl,
+  sanitizeRequirementLock,
+  buildIntelligenceInstruction,
+  buildCheckpointPrompt,
+  parseCheckpointJson,
+  buildDecisionExtractionPrompt,
+  parseDecisionJson,
+  buildPromptEnhancementPrompt,
+  parseEnhancedPromptJson,
+} from "./services/intelligenceLayer";
+import {
+  isValidEditSelectionAction,
+  buildLensPrompt,
+  parseLensJson,
+  buildEditSelectionPrompt,
+  parseEditSelectionJson,
+} from "./services/differentiationService";
+import {
+  selectModel,
+  executeWithRecovery,
+  AiRecoveryError,
+} from "./services/modelRouter";
+import {
+  recordFeatureMetric,
+  getMetricsSummary,
+} from "./services/observability";
+import {
+  isValidPdfAnalysisMode,
+  validatePdfBase64Payload,
+  buildPdfAnalysisPrompt,
+  resolveRoleplayPersona,
+  sanitizeRoleplayHistory,
+  buildRoleplayTurnSystemInstruction,
+  buildRoleplayReportPrompt,
+  parseRoleplayReportJson,
+} from "./services/ecosystemService";
 
 const app = express();
 const PORT = process.env.PORT || 8000;
@@ -184,10 +249,15 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 });
 
 // Cloudflare Origin Lock (#6):
-// If CF_ORIGIN_SECRET is configured, reject requests missing X-Origin-Secret header (except /health & /api/health)
+// If CF_ORIGIN_SECRET is configured, reject requests missing X-Origin-Secret header (except /, /health, /api/health & CORS preflight)
 app.use((req: Request, res: Response, next: NextFunction) => {
   const normalizedPath = (req.path || "").replace(/\/+$/, "") || "/";
-  if (normalizedPath === "/health" || normalizedPath === "/api/health") {
+  if (
+    req.method === "OPTIONS" ||
+    normalizedPath === "/" ||
+    normalizedPath === "/health" ||
+    normalizedPath === "/api/health"
+  ) {
     return next();
   }
 
@@ -228,7 +298,9 @@ const defaultProductionOrigins = [
   "https://axioma.id",
   "https://www.axioma.id",
   "http://localhost:3000",
+  "http://localhost:3001",
   "http://127.0.0.1:3000",
+  "http://127.0.0.1:3001",
 ];
 
 const allowedOrigins = new Set<string>([
@@ -236,37 +308,45 @@ const allowedOrigins = new Set<string>([
   ...configuredOrigins,
 ]);
 
-app.use(
-  cors({
-    origin: (origin, callback) => {
-      if (!origin) {
-        return callback(null, true);
-      }
-      const normalized = origin.trim().replace(/\/+$/, "");
-      if (
-        normalized.toLowerCase() !== "null" &&
-        (allowedOrigins.has(normalized) ||
-          (normalized.endsWith(".vercel.app") && normalized.includes("axioma")))
-      ) {
-        return callback(null, normalized);
-      }
-      return callback(null, false);
-    },
-    credentials: true,
-    methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: [
-      "Content-Type",
-      "Authorization",
-      "X-User-Id",
-      "X-Guest-Mode",
-      "X-Turnstile-Token",
-      "CF-Turnstile-Token",
-      "X-Origin-Secret",
-      "Accept",
-    ],
-    maxAge: 86400,
-  })
-);
+const corsOptions: cors.CorsOptions = {
+  origin: (origin, callback) => {
+    if (!origin) {
+      return callback(null, true);
+    }
+    const normalized = origin.trim().replace(/\/+$/, "");
+    if (
+      normalized.toLowerCase() !== "null" &&
+      (allowedOrigins.has(normalized) ||
+        (normalized.endsWith(".vercel.app") && normalized.includes("axioma")))
+    ) {
+      return callback(null, normalized);
+    }
+    return callback(null, false);
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "X-User-Id",
+    "X-Guest-Mode",
+    "X-Turnstile-Token",
+    "CF-Turnstile-Token",
+    "X-Origin-Secret",
+    "Accept",
+  ],
+  exposedHeaders: [
+    "X-Axioma-Remaining-Credits",
+    "X-RateLimit-Limit",
+    "X-RateLimit-Remaining",
+    "Retry-After",
+  ],
+  maxAge: 86400,
+};
+
+app.use(cors(corsOptions));
+// Express 5-safe wildcard preflight handler (avoids path-to-regexp v8 '*' PathError)
+app.options(/.*/, cors(corsOptions));
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 
@@ -341,11 +421,15 @@ app.use((err: any, req: Request, res: Response, next: NextFunction) => {
 
 // 2. Supabase Integration (Backend-only service key — NEVER use NEXT_PUBLIC_ for service key)
 const supabaseUrl = (process.env.SUPABASE_URL || "").trim();
-const supabaseServiceKey = (process.env.SUPABASE_SERVICE_KEY || "").trim();
+const supabaseServiceKey = (
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  process.env.SUPABASE_SERVICE_KEY ||
+  ""
+).trim();
 
 if (!supabaseUrl || !supabaseServiceKey) {
   throw new Error(
-    "Missing SUPABASE_URL or SUPABASE_SERVICE_KEY in backend environment. Service key must only reside on the backend."
+    "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY / SUPABASE_SERVICE_KEY in backend environment. Service key must only reside on the backend."
   );
 }
 
@@ -367,6 +451,7 @@ if (!isNewSupabaseSecretFormat) {
 const supabase = createClient(supabaseUrl, supabaseServiceKey, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
+bindQuotaSupabaseClient(supabase);
 
 // 3. Gemini API Integration & 4. Axioma Persona
 const geminiApiKey = process.env.GEMINI_API_KEY;
@@ -390,9 +475,9 @@ export interface AgentProfile {
 
 const CORE_AXIOMA_SYSTEM_INSTRUCTION = `Nama kamu adalah Axioma. Kamu adalah asisten cerdas dan sistem kreatif mandiri.
 ATURAN MUTLAK:
-1. JANGAN PERNAH menyebut dirimu sebagai AI, model bahasa besar (LLM), kecerdasan buatan, atau buatan Google/Gemini/OpenAI.
+1. JANGAN PERNAH menyebut dirimu sebagai model bahasa besar (LLM) atau buatan Google/Gemini/OpenAI.
 2. JANGAN PERNAH menyebut nama produk pihak ketiga seperti Midjourney, DALL-E, Stable Diffusion, Gemini, ChatGPT, Claude, Flux, atau Veo dalam percakapan kecuali pengguna yang bertanya secara spesifik tentang produk tersebut. Seluruh kemampuan visual, analisis, komputasi, dan penalaran adalah teknologi asli buatan Axioma sendiri.
-3. Gunakan gaya bahasa Indonesia yang natural, langsung pada inti persoalan, cerdas, hangat, dan tidak kaku seperti robot.
+3. Ikuti ATURAN BAHASA dan ATURAN GAYA BICARA (TONE) yang ditetapkan secara konsisten, tetap langsung pada inti persoalan, cerdas, dan natural.
 4. Jika pengguna meminta pembuatan gambar atau visual, langsung proses visualnya tanpa pernah menyuruh pengguna menggunakan aplikasi lain atau menawarkan pembuatan teks prompt.
 5. Jika pengguna bertanya tentang Axioma, fitur/kemampuan Axioma, "Tentang Kami", atau siapa pembuat/pencipta/pengembang aplikasi ini, jawablah secara natural dan profesional bahwa Axioma (v2.5 Stable) memiliki empat kemampuan inti — Penalaran & Analisis, Studio Visual Terpadu (gambar & video), Mode Suara Langsung dua arah, dan Arsitektur Lintas Perangkat — serta dibuat oleh Muhammad Nizam Putra Rasya dan Muhammad Rendy Ramadhani.`;
 
@@ -401,43 +486,31 @@ export const AGENT_PROFILES: Record<AgentId, AgentProfile> = {
     id: "axioma-pro",
     label: "Axioma Pro",
     shortName: "Axioma Pro",
-    modelChain: resolveEngine({
-      requestedMode: "pro",
-      taskType: "chat_deep",
-      agentId: "axioma-pro",
-    }).modelChain,
+    modelChain: getModelChain(),
     temperature: 0.4,
     systemInstruction: `${CORE_AXIOMA_SYSTEM_INSTRUCTION}
 
-Kamu adalah Axioma Pro, asisten analitis tingkat lanjut untuk penalaran mendalam, pemecahan masalah kompleks, dan pengambilan keputusan strategis. Kamu HARUS SELALU menjawab menggunakan Bahasa Indonesia yang profesional dan tajam, apa pun bahasa yang digunakan oleh pengguna. ATURAN PRIORITAS UTAMA: Selalu patuhi instruksi panjang, keringkasan, atau format yang diminta pengguna secara eksplisit (misalnya jika pengguna meminta 'jawab singkat', '1 kalimat saja', 'langsung intinya', atau 'tanpa poin/heading', berikan jawaban yang benar-benar singkat dan langsung tanpa heading atau uraian panjang). Hanya jika pengguna tidak membatasi panjang jawaban, uraikan analisis secara sistematis dan gunakan format Markdown seperlunya.`,
+Kamu adalah Axioma Pro, asisten analitis tingkat lanjut untuk penalaran mendalam, pemecahan masalah kompleks, dan pengambilan keputusan strategis. ATURAN PRIORITAS UTAMA: Selalu patuhi instruksi panjang, keringkasan, atau format yang diminta pengguna secara eksplisit (misalnya jika pengguna meminta 'jawab singkat', '1 kalimat saja', 'langsung intinya', atau 'tanpa poin/heading', berikan jawaban yang benar-benar singkat dan langsung tanpa heading atau uraian panjang). Hanya jika pengguna tidak membatasi panjang jawaban, uraikan analisis secara sistematis dan gunakan format Markdown seperlunya.`,
   },
   "axioma-omni": {
     id: "axioma-omni",
     label: "Axioma Omni",
     shortName: "Axioma Omni",
-    modelChain: resolveEngine({
-      requestedMode: "fast",
-      taskType: "chat",
-      agentId: "axioma-omni",
-    }).modelChain,
+    modelChain: getModelChain(),
     temperature: 0.7,
     systemInstruction: `${CORE_AXIOMA_SYSTEM_INSTRUCTION}
 
-Kamu adalah Axioma Omni, asisten serbaguna yang cepat, adaptif, dan komunikatif untuk kebutuhan harian, penulisan, ringkasan, dan eksplorasi ide. Kamu HARUS SELALU menjawab menggunakan Bahasa Indonesia yang ramah, lugas, natural, dan langsung ke inti permasalahan, apa pun bahasa yang digunakan oleh pengguna. Selalu ikuti permintaan panjang atau format dari pengguna (seperti menjawab singkat jika diminta). Gunakan format Markdown secukupnya agar jawaban ringkas dan nyaman dibaca.`,
+Kamu adalah Axioma Omni, asisten serbaguna yang cepat, adaptif, dan komunikatif untuk kebutuhan harian, penulisan, ringkasan, dan eksplorasi ide. Selalu ikuti permintaan panjang atau format dari pengguna (seperti menjawab singkat jika diminta). Gunakan format Markdown secukupnya agar jawaban ringkas dan nyaman dibaca.`,
   },
   "axioma-architect": {
     id: "axioma-architect",
     label: "Axioma Architect",
     shortName: "Axioma Architect",
-    modelChain: resolveEngine({
-      requestedMode: "pro",
-      taskType: "chat_deep",
-      agentId: "axioma-architect",
-    }).modelChain,
+    modelChain: getModelChain(),
     temperature: 0.2,
     systemInstruction: `${CORE_AXIOMA_SYSTEM_INSTRUCTION}
 
-Kamu adalah Axioma Architect, principal software engineer dan perancang sistem mandiri. Kamu HARUS SELALU menjawab menggunakan Bahasa Indonesia yang teknis, presisi, dan rapi, apa pun bahasa yang digunakan oleh pengguna. Selalu patuhi batasan panjang atau format yang diminta pengguna (jika diminta jawaban singkat, jawab secara ringkas dan padat). Saat diminta membuat kode atau merancang sistem: tulis kode yang bersih, modular, type-safe, dan siap produksi (lengkap dengan penanganan error), jelaskan arsitektur secara singkat, dan gunakan blok kode Markdown dengan penanda bahasa yang tepat.`,
+Kamu adalah Axioma Architect, principal software engineer dan perancang sistem mandiri. Selalu patuhi batasan panjang atau format yang diminta pengguna (jika diminta jawaban singkat, jawab secara ringkas dan padat). Saat diminta membuat kode atau merancang sistem: tulis kode yang bersih, modular, type-safe, dan siap produksi (lengkap dengan penanganan error), jelaskan arsitektur secara singkat, dan gunakan blok kode Markdown dengan penanda bahasa yang tepat.`,
   },
 };
 
@@ -454,7 +527,10 @@ function getModelInstance(
   profile: AgentProfile,
   extraInstruction?: string
 ) {
-  const isThinkingCapable = isThinkingCapableModel(modelName);
+  const isThinkingCapable =
+    modelName === "gemini-3-flash-preview" ||
+    modelName.includes("preview") ||
+    modelName.includes("thinking");
   const generationConfig: Record<string, any> = {
     temperature: profile.temperature,
   };
@@ -463,12 +539,12 @@ function getModelInstance(
   if (isThinkingCapable) {
     generationConfig.thinkingConfig = { thinkingBudget: 0 };
   }
-  const systemInstruction = extraInstruction
-    ? `${profile.systemInstruction}\n\n${extraInstruction}`
-    : profile.systemInstruction;
+  const basePrompt = extraInstruction
+    ? `${extraInstruction}\n\n${profile.systemInstruction}`
+    : `${buildSystemInstruction("auto", "santai")}\n\n${profile.systemInstruction}`;
   return genAI.getGenerativeModel({
     model: modelName,
-    systemInstruction,
+    systemInstruction: basePrompt,
     generationConfig,
   });
 }
@@ -477,12 +553,12 @@ function getModelInstance(
 // - AI_FIRST_CHUNK_TIMEOUT_MS (5s): max wait time until the first chunk (or non-stream response) arrives.
 // - AI_CHUNK_IDLE_TIMEOUT_MS (20s): once streaming has started, max idle time without receiving a new chunk.
 // - AI_TOTAL_SETUP_BUDGET_MS (50s): max budget to find a working model and receive the first chunk.
-const AI_TOTAL_SETUP_BUDGET_MS = 50_000;
-const AI_FIRST_CHUNK_TIMEOUT_MS = 5_000;
+const AI_TOTAL_SETUP_BUDGET_MS = 75_000;
+const AI_FIRST_CHUNK_TIMEOUT_MS = 12_000;
 const AI_CHUNK_IDLE_TIMEOUT_MS = 20_000;
 const AI_MIN_ATTEMPT_MS = 2_000;
-const REQUEST_WATCHDOG_MS = 55_000;
-const STREAM_WATCHDOG_EXTENSION_MS = 30_000;
+const REQUEST_WATCHDOG_MS = 90_000;
+const STREAM_WATCHDOG_EXTENSION_MS = 35_000;
 const MODEL_QUOTA_COOLDOWN_MS = 2 * 60_000; // 2 min cooldown for transient 429 / timeout
 const MODEL_ZERO_QUOTA_COOLDOWN_MS = 30 * 60_000; // 30 min cooldown when model has limit: 0 / daily quota exhausted
 
@@ -968,12 +1044,20 @@ interface SendMessageRequest {
   stream?: boolean;
   user_id?: string;
   agent_id?: string;
-  engine_mode?: string;
-  engineMode?: string;
-  thinking_mode?: string;
-  thinkingMode?: string;
-  task_type?: string;
-  taskType?: string;
+  language?: LanguageCode | string;
+  tone?: ToneStyle | string;
+  answerStyle?: AnswerStyle | string;
+  thinkingMode?: ThinkingMode | string;
+  contextSummary?: string;
+  checkpoint?: ConversationCheckpoint;
+  contextCorrection?: string;
+  socialTarget?: SocialTarget | string;
+  taskBreakdownMode?: boolean;
+  workspaceContext?: WorkspaceContext;
+  decisionHistory?: DecisionJournalEntry[];
+  userProfile?: string;
+  contextControl?: ContextControl;
+  requirementLock?: string[];
   regenerate?: boolean;
   turnstile_token?: string;
   attachment_ids?: string[];
@@ -985,12 +1069,25 @@ interface ApiResponse<T = any> {
   success: boolean;
   data?: T;
   error?: string;
+  message?: string;
   code?: string;
   agent_id?: string;
   agent_name?: string;
   message_id?: string;
   ai_message_id?: string;
   user_message_id?: string | null;
+  imageUrl?: string;
+  videoUrl?: string;
+  mediaType?: "image" | "video";
+  mediaTitle?: string;
+  revisedPrompt?: string;
+  remainingCredits?: number;
+  remaining?: number;
+  dailyCredits?: number;
+  bonusCredits?: number;
+  required?: number;
+  resetAt?: string;
+  suggestedModel?: string;
   chat?: { id: string; title: string; created_at?: string };
 }
 
@@ -1055,6 +1152,8 @@ interface Logger {
 interface ResolvedUser {
   id: string;
   authenticated: boolean;
+  email?: string;
+  name?: string;
 }
 
 // Helpers
@@ -1109,7 +1208,21 @@ async function resolveRequestUser(
     try {
       const { data, error } = await supabase.auth.getUser(rawToken);
       if (!error && data?.user) {
-        return { user: { id: data.user.id, authenticated: true } };
+        const meta = (data.user.user_metadata || {}) as Record<string, unknown>;
+        const email = typeof data.user.email === "string" ? data.user.email.trim() : "";
+        const name =
+          (typeof meta.full_name === "string" && meta.full_name.trim()) ||
+          (typeof meta.name === "string" && meta.name.trim()) ||
+          (email ? email.split("@")[0] : "") ||
+          "Pengguna";
+        return {
+          user: {
+            id: data.user.id,
+            authenticated: true,
+            email,
+            name,
+          },
+        };
       }
       log.warn(`AUTH token validation failed: ${error?.message || "no user"}. Falling back to guest mode.`);
     } catch (err: any) {
@@ -1284,8 +1397,7 @@ async function generateWithFallbackAndRetry(
   log: Logger,
   agentProfile: AgentProfile,
   onChunk?: (chunkText: string) => void,
-  extraInstruction?: string,
-  overrideModelChain?: readonly string[]
+  extraInstruction?: string
 ): Promise<{
   text: string;
   modelUsed: string;
@@ -1303,17 +1415,12 @@ async function generateWithFallbackAndRetry(
   let fallbackOverheadMs = 0;
   const attempts: AiAttemptLog[] = [];
 
-  const activeChain =
-    overrideModelChain && overrideModelChain.length > 0
-      ? overrideModelChain
-      : agentProfile.modelChain;
-
   // Prioritize models that are not currently in a 429/timeout cooldown (#7, #9)
   const now = Date.now();
-  const availableModels = activeChain.filter(
+  const availableModels = agentProfile.modelChain.filter(
     (m) => (modelCooldownUntil.get(m) || 0) <= now
   );
-  const cooledDownModels = activeChain.filter(
+  const cooledDownModels = agentProfile.modelChain.filter(
     (m) => (modelCooldownUntil.get(m) || 0) > now
   );
   const orderedChain = [...availableModels, ...cooledDownModels];
@@ -1417,7 +1524,22 @@ async function generateWithFallbackAndRetry(
           streamResult.response.catch(() => {});
 
           for await (const chunk of streamResult.stream) {
-            const piece = chunk.text();
+            // Any incoming SSE packet from Gemini proves stream is alive; switch off first-chunk timer
+            armChunkIdleTimer();
+            let piece = "";
+            try {
+              piece = chunk.text();
+            } catch (chunkTextErr: any) {
+              if (chunksEmitted === 0) {
+                throw chunkTextErr;
+              }
+              log.warn(
+                `STEP3 ignored non-text trailing chunk on ${modelName}: ${
+                  chunkTextErr?.message || chunkTextErr
+                }`
+              );
+              continue;
+            }
             if (piece) {
               if (chunksEmitted === 0) {
                 firstChunkMs = Date.now() - attemptStartedAt;
@@ -1425,8 +1547,6 @@ async function generateWithFallbackAndRetry(
                   `STEP3 first chunk received from ${modelName} in ${firstChunkMs}ms (switching to ${AI_CHUNK_IDLE_TIMEOUT_MS}ms idle timeout)`
                 );
               }
-              // Reset the 20s inter-chunk idle timer on every chunk (#5)
-              armChunkIdleTimer();
               fullText += piece;
               chunksEmitted++;
               onChunk(piece);
@@ -1545,22 +1665,140 @@ async function generateWithFallbackAndRetry(
           ? `STREAM_IDLE_TIMEOUT after ${AI_CHUNK_IDLE_TIMEOUT_MS}ms idle (chunks=${chunksEmitted})`
           : `status=${err?.status ?? "n/a"}`;
 
+      console.error("[SSE_ERROR]", {
+        model: modelName,
+        attempt,
+        chunksEmitted,
+        timeoutPhase,
+        status: err?.status,
+        message: err?.message || String(err),
+      });
+
       log.warn(
         `STEP3 attempt ${attempt} (${modelName}) failed after ${attemptElapsed}ms (${reason}): ${String(
           err?.message || err
         ).slice(0, 300)}`
       );
 
-      // If chunks were already streamed to the client, do not start a second stream on top of it
+      // If chunks were already streamed and the model dropped mid-stream (e.g. Google 503 / Failed to parse stream),
+      // seamlessly continue on the next healthy fallback model before reporting an error to the client.
       if (chunksEmitted > 0) {
+        const remainingFallbackModels = orderedChain.slice(i + 1);
+        if (onChunk && fullText.trim() && remainingFallbackModels.length > 0 && !parentSignal.aborted) {
+          const continuationContents: Content[] = [
+            ...contents,
+            { role: "model", parts: [{ text: fullText }] },
+            {
+              role: "user",
+              parts: [
+                {
+                  text: "Lanjutkan tepat dari karakter terakhir jawaban di atas secara mulus tanpa mengulang teks sebelumnya dan tanpa kata pengantar.",
+                },
+              ],
+            },
+          ];
+
+          for (const fallbackModel of remainingFallbackModels) {
+            if (parentSignal.aborted) break;
+            const fbStart = Date.now();
+            const fbController = new AbortController();
+            const onFbParentAbort = () => fbController.abort();
+            parentSignal.addEventListener("abort", onFbParentAbort, { once: true });
+            let fbTimer: ReturnType<typeof setTimeout> | null = setTimeout(
+              () => fbController.abort(),
+              AI_CHUNK_IDLE_TIMEOUT_MS
+            );
+            const resetFbTimer = () => {
+              if (fbTimer) clearTimeout(fbTimer);
+              fbTimer = setTimeout(() => fbController.abort(), AI_CHUNK_IDLE_TIMEOUT_MS);
+            };
+
+            try {
+              log.info(
+                `STEP3 mid-stream recovery: continuing ${fullText.length} chars on fallback model "${fallbackModel}"`
+              );
+              const fbInstance = getModelInstance(fallbackModel, agentProfile, extraInstruction);
+              const fbStream = await fbInstance.generateContentStream(
+                { contents: continuationContents },
+                { signal: fbController.signal }
+              );
+              fbStream.response.catch(() => {});
+
+              let fbChunks = 0;
+              for await (const fbChunk of fbStream.stream) {
+                resetFbTimer();
+                let fbPiece = "";
+                try {
+                  fbPiece = fbChunk.text();
+                } catch {
+                  continue;
+                }
+                if (fbPiece) {
+                  fullText += fbPiece;
+                  fbChunks++;
+                  chunksEmitted++;
+                  onChunk(fbPiece);
+                }
+              }
+
+              if (fbTimer) clearTimeout(fbTimer);
+              parentSignal.removeEventListener("abort", onFbParentAbort);
+
+              if (fbChunks > 0) {
+                const fbElapsed = Date.now() - fbStart;
+                modelCooldownUntil.delete(fallbackModel);
+                attempts.push({
+                  model: fallbackModel,
+                  status: "ok",
+                  elapsed_ms: fbElapsed,
+                });
+                log.info(
+                  `STEP3 mid-stream recovery succeeded on "${fallbackModel}" (+${fbChunks} chunks, totalChars=${fullText.length}, elapsed=${fbElapsed}ms)`
+                );
+                return {
+                  text: fullText,
+                  modelUsed: fallbackModel,
+                  firstChunkMs,
+                  streamMs: Math.max(0, Date.now() - attemptStartedAt - firstChunkMs),
+                  totalAiMs: Date.now() - overallAiStart,
+                  fallbackCount: attempts.length - 1,
+                  fallbackOverheadMs: fallbackOverheadMs + fbElapsed,
+                  attempts,
+                };
+              }
+            } catch (fbErr: any) {
+              if (fbTimer) clearTimeout(fbTimer);
+              parentSignal.removeEventListener("abort", onFbParentAbort);
+              console.error("[SSE_ERROR] mid-stream recovery fallback failed:", {
+                fallbackModel,
+                status: fbErr?.status,
+                message: fbErr?.message || String(fbErr),
+              });
+              attempts.push({
+                model: fallbackModel,
+                status: isQuotaOrRateLimitError(fbErr) ? "429_quota" : "error",
+                elapsed_ms: Date.now() - fbStart,
+              });
+            }
+          }
+        }
+
+        const isStreamParseOrOverload =
+          errMsgLower.includes("failed to parse stream") ||
+          errMsgLower.includes("503") ||
+          errMsgLower.includes("high demand") ||
+          errMsgLower.includes("unavailable") ||
+          errMsgLower.includes("overloaded");
         const errMessage =
           timeoutPhase === "chunk_idle"
             ? "Streaming AI terhenti karena tidak ada data baru selama 20 detik. Silakan coba lagi."
-            : "Koneksi streaming AI terputus di tengah jalan. Silakan coba lagi.";
+            : isStreamParseOrOverload
+              ? "Server model AI sedang sibuk (503 high demand) saat streaming berlangsung. Silakan coba kirim ulang."
+              : `Koneksi streaming AI terputus (${String(err?.message || "gangguan jaringan").slice(0, 120)}). Silakan coba lagi.`;
         throw new AiGenerationError(
-          timeoutPhase === "chunk_idle" ? "timeout" : "failed",
+          timeoutPhase === "chunk_idle" ? "timeout" : isStreamParseOrOverload ? "busy" : "failed",
           errMessage,
-          timeoutPhase === "chunk_idle" ? 504 : 502,
+          timeoutPhase === "chunk_idle" ? 504 : isStreamParseOrOverload ? 503 : 502,
           fullText
         );
       }
@@ -1722,21 +1960,50 @@ const handleHealthCheck = async (req: Request, res: Response) => {
   }
 };
 
+// Simple root health check for quick browser/local connectivity verification
+app.get("/", (_req: Request, res: Response) => {
+  return res.status(200).json({
+    status: "ok",
+    message: "Axioma backend-dev running",
+  });
+});
+
 app.get("/health", handleHealthCheck);
 // Lightweight warmup endpoint: returns { ok: true } instantly without DB access (#1)
 app.get("/api/health", (_req: Request, res: Response) => {
   return res.status(200).json({ ok: true });
 });
 
-// Dynamic AI Engine Catalog Endpoint: GET /api/engines
-app.get("/api/engines", (_req: Request, res: Response) => {
-  const engines = getPublicEngineList();
-  const defaultEngine = engines.find((e) => e.isDefault)?.id || "auto";
-  return res.status(200).json({
-    success: true,
-    defaultEngine,
-    engines,
-  });
+// Daily Credit Quota Info Endpoint: GET /api/quota
+app.get("/api/quota", async (req: Request, res: Response) => {
+  const requestId = randomUUID().slice(0, 8);
+  const log = createLogger(requestId);
+
+  try {
+    const { user, authError } = await resolveRequestUser(req, log);
+    if (authError || !user) {
+      return res.status(401).json({
+        success: false,
+        code: "unauthorized",
+        error: authError || "Autentikasi diperlukan.",
+      });
+    }
+
+    const quota = await getUserQuota(user.id);
+    res.setHeader("X-Axioma-Remaining-Credits", String(quota.remainingCredits));
+    return res.status(200).json({
+      success: true,
+      authenticated: user.authenticated,
+      ...quota,
+    });
+  } catch (err: any) {
+    log.error("GET /api/quota error", err);
+    return res.status(500).json({
+      success: false,
+      code: "quota_lookup_failed",
+      error: "Gagal memuat informasi kuota kredit harian.",
+    });
+  }
 });
 
 // 6a. List User's Chats: GET /api/chats (#2, #3)
@@ -2696,17 +2963,57 @@ app.post(
     }
 
     try {
+      const { user } = await resolveRequestUser(req, log);
+      let remainingCredits: number | undefined;
+      if (user?.authenticated) {
+        const quotaCheck = await checkAndConsumeQuota(user.id, "media");
+        res.setHeader("X-Axioma-Remaining-Credits", String(quotaCheck.remaining));
+        if (!quotaCheck.allowed) {
+          res.setHeader("Content-Type", "application/json; charset=utf-8");
+          return res.status(429).json({
+            success: false,
+            code: "QUOTA_EXCEEDED",
+            message: "Kuota kredit harian Anda tidak mencukupi untuk model ini.",
+            error: "Kuota kredit harian Anda tidak mencukupi untuk model ini.",
+            remaining: quotaCheck.remaining,
+            dailyCredits: quotaCheck.dailyCredits,
+            bonusCredits: quotaCheck.bonusCredits,
+            required: quotaCheck.required,
+            resetAt: quotaCheck.resetAt,
+            suggestedModel: "omni",
+          });
+        }
+        remainingCredits = quotaCheck.remaining;
+      }
+
       log.info(`Generating image for prompt: "${prompt.slice(0, 50)}..." from ip=${clientIp}`);
-      const result = await generateMediaImage(prompt);
+      let strictPrompt = prompt.trim();
+      try {
+        const translated = await buildStrictVisualPrompt(prompt, "image");
+        if (translated && translated.trim()) {
+          strictPrompt = translated.trim();
+        }
+      } catch (promptErr: any) {
+        console.error("[/api/generate/image] buildStrictVisualPrompt failed, using raw prompt:", promptErr);
+        log.warn(`buildStrictVisualPrompt fallback to raw prompt: ${promptErr?.message || promptErr}`);
+      }
+      const result = await generateMediaImage(prompt, strictPrompt);
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
       return res.status(200).json({
         success: true,
         url: result.url,
+        imageUrl: result.url,
+        mediaType: "image",
         source: result.source,
+        revisedPrompt: result.revisedPrompt,
         enhanced_prompt: result.enhancedPrompt,
         original_prompt: result.originalPrompt,
+        ...(typeof remainingCredits === "number" ? { remainingCredits } : {}),
       });
     } catch (err: any) {
+      console.error("[/api/generate/image] Image generation failed:", err);
       log.error("Image generation failed", err);
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
       return res.status(500).json({
         success: false,
         code: "image_gen_failed",
@@ -2735,19 +3042,61 @@ app.post(
     }
 
     try {
+      const { user } = await resolveRequestUser(req, log);
+      let remainingCredits: number | undefined;
+      if (user?.authenticated) {
+        const quotaCheck = await checkAndConsumeQuota(user.id, "media");
+        res.setHeader("X-Axioma-Remaining-Credits", String(quotaCheck.remaining));
+        if (!quotaCheck.allowed) {
+          res.setHeader("Content-Type", "application/json; charset=utf-8");
+          return res.status(429).json({
+            success: false,
+            code: "QUOTA_EXCEEDED",
+            message: "Kuota kredit harian Anda tidak mencukupi untuk model ini.",
+            error: "Kuota kredit harian Anda tidak mencukupi untuk model ini.",
+            remaining: quotaCheck.remaining,
+            dailyCredits: quotaCheck.dailyCredits,
+            bonusCredits: quotaCheck.bonusCredits,
+            required: quotaCheck.required,
+            resetAt: quotaCheck.resetAt,
+            suggestedModel: "omni",
+          });
+        }
+        remainingCredits = quotaCheck.remaining;
+      }
+
       log.info(`Generating video design for prompt: "${prompt.slice(0, 50)}..." from ip=${clientIp}`);
-      const result = await generateMediaVideo(prompt);
+      let strictPrompt = prompt.trim();
+      try {
+        const translated = await buildStrictVisualPrompt(prompt, "video");
+        if (translated && translated.trim()) {
+          strictPrompt = translated.trim();
+        }
+      } catch (promptErr: any) {
+        console.error("[/api/generate/video] buildStrictVisualPrompt failed, using raw prompt:", promptErr);
+        log.warn(`buildStrictVisualPrompt fallback to raw prompt: ${promptErr?.message || promptErr}`);
+      }
+      const result = await generateMediaVideo(prompt, strictPrompt);
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
       return res.status(200).json({
         success: true,
         status: result.status,
         video_url: result.videoUrl,
+        videoUrl: result.videoUrl,
+        mediaType: "video",
         operation_name: result.operationName,
+        revisedPrompt: result.revisedPrompt,
         enhanced_prompt: result.enhancedPrompt,
         original_prompt: result.originalPrompt,
+        search_keywords: result.searchKeywords,
+        provider: result.provider,
         message: result.message,
+        ...(typeof remainingCredits === "number" ? { remainingCredits } : {}),
       });
     } catch (err: any) {
+      console.error("[/api/generate/video] Video generation failed:", err);
       log.error("Video generation failed", err);
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
       return res.status(500).json({
         success: false,
         code: "video_gen_failed",
@@ -2760,10 +3109,1307 @@ app.post(
 // Track in-flight streaming requests per chat so DELETE /api/chats/:id can abort background streams immediately (#2)
 const activeChatStreams = new Map<string, AbortController>();
 
+// 6b. Context & Checkpoint Summary Endpoint: POST /api/chat/checkpoint (and alias /api/chats/checkpoint)
+app.post(
+  ["/api/chat/checkpoint", "/api/chats/checkpoint"],
+  chatGeminiLimiter,
+  express.json({ limit: "256kb" }),
+  async (req: Request, res: Response) => {
+    const requestId = randomUUID().slice(0, 8);
+    const log = createLogger(requestId);
+    const startMs = Date.now();
+
+    const rawMessages = req.body?.messages;
+    if (!Array.isArray(rawMessages) || rawMessages.length === 0) {
+      return res.status(400).json({
+        success: false,
+        code: "messages_required",
+        error: "Field 'messages' harus berupa array percakapan yang tidak kosong.",
+      });
+    }
+
+    const validMessages = rawMessages
+      .filter(
+        (m: any) =>
+          m &&
+          typeof m === "object" &&
+          typeof m.content === "string" &&
+          m.content.trim().length > 0
+      )
+      .map((m: any) => ({
+        role: typeof m.role === "string" ? m.role : "user",
+        content: m.content.trim(),
+      }))
+      .slice(-12);
+
+    if (validMessages.length === 0) {
+      return res.status(400).json({
+        success: false,
+        code: "messages_empty",
+        error: "Tidak ada pesan teks valid untuk diringkas menjadi checkpoint.",
+      });
+    }
+
+    if (!canConsumeDailyGeminiQuota()) {
+      return res.status(503).json({
+        success: false,
+        code: "daily_quota_exceeded",
+        error: "Kuota AI hari ini sudah habis. Tersedia lagi pukul 07.00 WIB.",
+      });
+    }
+
+    try {
+      const prompt = buildCheckpointPrompt(validMessages);
+      const { result: rawText, modelUsed } = await callGeminiWithFallback(
+        async (modelName, signal) => {
+          recordGeminiCallAttempt();
+          const isThinkingCapable =
+            modelName === "gemini-3-flash-preview" ||
+            modelName.includes("preview") ||
+            modelName.includes("thinking");
+          const generationConfig: Record<string, any> = {
+            temperature: 0.2,
+            responseMimeType: "application/json",
+          };
+          if (isThinkingCapable) {
+            generationConfig.thinkingConfig = { thinkingBudget: 0 };
+          }
+          const model = genAI.getGenerativeModel({
+            model: modelName,
+            generationConfig,
+          });
+          const resp = await model.generateContent(prompt, { signal });
+          return resp.response.text();
+        },
+        {
+          purpose: "chat_checkpoint",
+          timeoutMs: 15_000,
+        }
+      );
+
+      const checkpoint = parseCheckpointJson(rawText);
+      const latencyMs = Date.now() - startMs;
+      log.info(
+        `[CHECKPOINT_METRICS] ${JSON.stringify({
+          messagesUsed: validMessages.length,
+          modelUsed,
+          latencyMs,
+        })}`
+      );
+
+      return res.status(200).json({
+        success: true,
+        ...checkpoint,
+        data: checkpoint,
+      });
+    } catch (err: any) {
+      log.error("POST /api/chat/checkpoint failed", err);
+      reportCentralizedError(err, {
+        route: "/api/chat/checkpoint",
+        method: "POST",
+        ip: getClientIp(req),
+      });
+      return res.status(502).json({
+        success: false,
+        code: "checkpoint_failed",
+        error: "Gagal membuat ringkasan checkpoint percakapan. Silakan coba lagi.",
+      });
+    }
+  }
+);
+
+// 6b-2. Decision Journal Extraction Endpoint: POST /api/chat/decision (and alias /api/chats/decision)
+app.post(
+  ["/api/chat/decision", "/api/chats/decision"],
+  chatGeminiLimiter,
+  express.json({ limit: "256kb" }),
+  async (req: Request, res: Response) => {
+    const requestId = randomUUID().slice(0, 8);
+    const log = createLogger(requestId);
+    const startMs = Date.now();
+
+    const rawMessages = req.body?.messages;
+    if (!Array.isArray(rawMessages) || rawMessages.length === 0) {
+      return res.status(400).json({
+        success: false,
+        code: "messages_required",
+        error: "Field 'messages' harus berupa array percakapan yang tidak kosong.",
+      });
+    }
+
+    const validMessages = rawMessages
+      .filter(
+        (m: any) =>
+          m &&
+          typeof m === "object" &&
+          typeof m.content === "string" &&
+          m.content.trim().length > 0
+      )
+      .map((m: any) => ({
+        role: typeof m.role === "string" ? m.role : "user",
+        content: m.content.trim(),
+      }))
+      .slice(-8);
+
+    if (validMessages.length === 0) {
+      return res.status(400).json({
+        success: false,
+        code: "messages_empty",
+        error: "Tidak ada pesan teks valid untuk diekstrak menjadi catatan keputusan.",
+      });
+    }
+
+    if (!canConsumeDailyGeminiQuota()) {
+      return res.status(503).json({
+        success: false,
+        code: "daily_quota_exceeded",
+        error: "Kuota AI hari ini sudah habis. Tersedia lagi pukul 07.00 WIB.",
+      });
+    }
+
+    try {
+      const prompt = buildDecisionExtractionPrompt(validMessages);
+      const { result: rawText, modelUsed } = await callGeminiWithFallback(
+        async (modelName, signal) => {
+          recordGeminiCallAttempt();
+          const isThinkingCapable =
+            modelName === "gemini-3-flash-preview" ||
+            modelName.includes("preview") ||
+            modelName.includes("thinking");
+          const generationConfig: Record<string, any> = {
+            temperature: 0.2,
+            responseMimeType: "application/json",
+          };
+          if (isThinkingCapable) {
+            generationConfig.thinkingConfig = { thinkingBudget: 0 };
+          }
+          const model = genAI.getGenerativeModel({
+            model: modelName,
+            generationConfig,
+          });
+          const resp = await model.generateContent(prompt, { signal });
+          return resp.response.text();
+        },
+        {
+          purpose: "chat_decision",
+          timeoutMs: 15_000,
+        }
+      );
+
+      const extracted = parseDecisionJson(rawText);
+      const latencyMs = Date.now() - startMs;
+      log.info(
+        `[DECISION_METRICS] ${JSON.stringify({
+          messagesUsed: validMessages.length,
+          modelUsed,
+          latencyMs,
+        })}`
+      );
+
+      return res.status(200).json({
+        success: true,
+        ...extracted,
+        data: extracted,
+      });
+    } catch (err: any) {
+      log.error("POST /api/chat/decision failed", err);
+      reportCentralizedError(err, {
+        route: "/api/chat/decision",
+        method: "POST",
+        ip: getClientIp(req),
+      });
+      return res.status(502).json({
+        success: false,
+        code: "decision_extract_failed",
+        error: "Gagal mengekstrak keputusan dari percakapan. Silakan coba lagi.",
+      });
+    }
+  }
+);
+
+// 6b-5. Prompt Enhancement Endpoint: POST /api/chat/enhance-prompt (and alias /api/chats/enhance-prompt)
+app.post(
+  ["/api/chat/enhance-prompt", "/api/chats/enhance-prompt"],
+  chatGeminiLimiter,
+  express.json({ limit: "64kb" }),
+  async (req: Request, res: Response) => {
+    const requestId = randomUUID().slice(0, 8);
+    const log = createLogger(requestId);
+    const startMs = Date.now();
+
+    const rawDraft = typeof req.body?.draft === "string" ? req.body.draft.trim() : "";
+    if (!rawDraft) {
+      return res.status(400).json({
+        success: false,
+        code: "draft_required",
+        error: "Field 'draft' wajib diisi untuk merapikan prompt.",
+      });
+    }
+
+    if (rawDraft.length > 4000) {
+      return res.status(400).json({
+        success: false,
+        code: "draft_too_long",
+        error: "Panjang 'draft' maksimal 4.000 karakter.",
+      });
+    }
+
+    if (!canConsumeDailyGeminiQuota()) {
+      return res.status(503).json({
+        success: false,
+        code: "daily_quota_exceeded",
+        error: "Kuota AI hari ini sudah habis. Tersedia lagi pukul 07.00 WIB.",
+      });
+    }
+
+    const language = resolveLanguageCode(req.body?.language);
+
+    try {
+      const prompt = buildPromptEnhancementPrompt(rawDraft, language);
+      const { result: rawText, modelUsed } = await callGeminiWithFallback(
+        async (modelName, signal) => {
+          recordGeminiCallAttempt();
+          const isThinkingCapable =
+            modelName === "gemini-3-flash-preview" ||
+            modelName.includes("preview") ||
+            modelName.includes("thinking");
+          const generationConfig: Record<string, any> = {
+            temperature: 0.3,
+            responseMimeType: "application/json",
+          };
+          if (isThinkingCapable) {
+            generationConfig.thinkingConfig = { thinkingBudget: 0 };
+          }
+          const model = genAI.getGenerativeModel({
+            model: modelName,
+            generationConfig,
+          });
+          const resp = await model.generateContent(prompt, { signal });
+          return resp.response.text();
+        },
+        {
+          purpose: "chat_enhance_prompt",
+          timeoutMs: 15_000,
+        }
+      );
+
+      const { enhancedPrompt } = parseEnhancedPromptJson(rawText, rawDraft);
+      const latencyMs = Date.now() - startMs;
+
+      log.info(
+        `[ENHANCE_PROMPT_METRICS] ${JSON.stringify({
+          language,
+          draftLength: rawDraft.length,
+          enhancedLength: enhancedPrompt.length,
+          modelUsed,
+          latencyMs,
+        })}`
+      );
+
+      return res.status(200).json({
+        success: true,
+        enhancedPrompt,
+        data: { enhancedPrompt },
+      });
+    } catch (err: any) {
+      log.error("POST /api/chat/enhance-prompt failed", err);
+      reportCentralizedError(err, {
+        route: "/api/chat/enhance-prompt",
+        method: "POST",
+        ip: getClientIp(req),
+      });
+      return res.status(502).json({
+        success: false,
+        code: "enhance_prompt_failed",
+        error: "Gagal merapikan prompt. Silakan coba lagi.",
+      });
+    }
+  }
+);
+
+// 6b-6. Structured Response Feedback Endpoint: POST /api/chat/feedback (and alias /api/chats/feedback)
+app.post(
+  ["/api/chat/feedback", "/api/chats/feedback"],
+  express.json({ limit: "64kb" }),
+  (req: Request, res: Response) => {
+    const requestId = randomUUID().slice(0, 8);
+    const log = createLogger(requestId);
+
+    const { chatId, messageId, rating, reason, note, meta } = req.body || {};
+    if (rating !== "up" && rating !== "down") {
+      return res.status(400).json({
+        success: false,
+        code: "invalid_rating",
+        error: "Field 'rating' wajib bernilai 'up' atau 'down'.",
+      });
+    }
+
+    const entry = {
+      timestamp: new Date().toISOString(),
+      requestId,
+      chatId: typeof chatId === "string" ? chatId.trim().slice(0, 128) : undefined,
+      messageId: typeof messageId === "string" ? messageId.trim().slice(0, 128) : undefined,
+      rating,
+      reason: typeof reason === "string" ? reason.trim().slice(0, 200) : undefined,
+      note: typeof note === "string" ? note.trim().slice(0, 1000) : undefined,
+      meta:
+        meta && typeof meta === "object" && !Array.isArray(meta)
+          ? (meta as Record<string, unknown>)
+          : undefined,
+    };
+
+    try {
+      const logsDir = path.join(process.cwd(), "logs");
+      fs.mkdirSync(logsDir, { recursive: true });
+      fs.appendFileSync(
+        path.join(logsDir, "feedback.jsonl"),
+        `${JSON.stringify(entry)}\n`,
+        "utf8"
+      );
+    } catch (fsErr: any) {
+      log.warn(`Feedback file append skipped (fallback to stdout): ${fsErr?.message || fsErr}`);
+    }
+
+    log.info(`[STRUCTURED_FEEDBACK] ${JSON.stringify(entry)}`);
+
+    return res.status(200).json({
+      status: "ok",
+      success: true,
+    });
+  }
+);
+
+// 6b-7. Axioma Lens (2-Sided Critical Analysis): POST /api/chat/lens (and alias /api/chats/lens)
+app.post(
+  ["/api/chat/lens", "/api/chats/lens"],
+  chatGeminiLimiter,
+  express.json({ limit: "128kb" }),
+  async (req: Request, res: Response) => {
+    const requestId = randomUUID().slice(0, 8);
+    const log = createLogger(requestId);
+    const startMs = Date.now();
+
+    const rawTopic = typeof req.body?.topic === "string" ? req.body.topic.trim() : "";
+    if (!rawTopic) {
+      return res.status(400).json({
+        success: false,
+        code: "topic_required",
+        error: "Field 'topic' wajib diisi untuk analisis Axioma Lens.",
+      });
+    }
+
+    if (rawTopic.length > 2000) {
+      return res.status(400).json({
+        success: false,
+        code: "topic_too_long",
+        error: "Panjang 'topic' maksimal 2.000 karakter.",
+      });
+    }
+
+    if (!canConsumeDailyGeminiQuota()) {
+      return res.status(503).json({
+        success: false,
+        code: "daily_quota_exceeded",
+        error: "Kuota AI hari ini sudah habis. Tersedia lagi pukul 07.00 WIB.",
+      });
+    }
+
+    const contextSummary =
+      typeof req.body?.contextSummary === "string" ? req.body.contextSummary.trim() : undefined;
+    const language =
+      typeof req.body?.language === "string" ? req.body.language.trim() : undefined;
+
+    try {
+      const prompt = buildLensPrompt({ topic: rawTopic, contextSummary, language });
+      const { result: rawText, modelUsed } = await callGeminiWithFallback(
+        async (modelName, signal) => {
+          recordGeminiCallAttempt();
+          const isThinkingCapable =
+            modelName === "gemini-3-flash-preview" ||
+            modelName.includes("preview") ||
+            modelName.includes("thinking");
+          const generationConfig: Record<string, any> = {
+            temperature: 0.4,
+            responseMimeType: "application/json",
+          };
+          if (isThinkingCapable) {
+            generationConfig.thinkingConfig = { thinkingBudget: 0 };
+          }
+          const model = genAI.getGenerativeModel({
+            model: modelName,
+            generationConfig,
+          });
+          const resp = await model.generateContent(prompt, { signal });
+          return resp.response.text();
+        },
+        {
+          purpose: "chat_lens",
+          timeoutMs: 20_000,
+        }
+      );
+
+      const lens = parseLensJson(rawText, rawTopic);
+      const latencyMs = Date.now() - startMs;
+
+      log.info(
+        `[LENS_METRICS] ${JSON.stringify({
+          language: language || "auto",
+          prosCount: lens.pros.length,
+          consCount: lens.cons.length,
+          blindspotsCount: lens.blindspots.length,
+          modelUsed,
+          latencyMs,
+        })}`
+      );
+
+      return res.status(200).json({
+        success: true,
+        ...lens,
+        data: lens,
+      });
+    } catch (err: any) {
+      log.error("POST /api/chat/lens failed", err);
+      reportCentralizedError(err, {
+        route: "/api/chat/lens",
+        method: "POST",
+        ip: getClientIp(req),
+      });
+      return res.status(502).json({
+        success: false,
+        code: "lens_failed",
+        error: "Gagal menganalisis topik dengan Axioma Lens. Silakan coba lagi.",
+      });
+    }
+  }
+);
+
+// 6b-8. Highlight-to-Edit (Partial Text Revision): POST /api/chat/edit-selection (and alias /api/chats/edit-selection)
+app.post(
+  ["/api/chat/edit-selection", "/api/chats/edit-selection"],
+  chatGeminiLimiter,
+  express.json({ limit: "128kb" }),
+  async (req: Request, res: Response) => {
+    const requestId = randomUUID().slice(0, 8);
+    const log = createLogger(requestId);
+    const startMs = Date.now();
+
+    const rawSelected =
+      typeof req.body?.selectedText === "string" ? req.body.selectedText.trim() : "";
+    const rawAction = req.body?.action;
+
+    if (!rawSelected) {
+      return res.status(400).json({
+        success: false,
+        code: "selected_text_required",
+        error: "Field 'selectedText' wajib diisi.",
+      });
+    }
+
+    if (rawSelected.length > 3000) {
+      return res.status(400).json({
+        success: false,
+        code: "selected_text_too_long",
+        error: "Panjang 'selectedText' maksimal 3.000 karakter.",
+      });
+    }
+
+    if (!isValidEditSelectionAction(rawAction)) {
+      return res.status(400).json({
+        success: false,
+        code: "invalid_action",
+        error:
+          "Field 'action' harus salah satu dari: shorten, soften, formal, assertive, translate_en, translate_id.",
+      });
+    }
+
+    if (!canConsumeDailyGeminiQuota()) {
+      return res.status(503).json({
+        success: false,
+        code: "daily_quota_exceeded",
+        error: "Kuota AI hari ini sudah habis. Tersedia lagi pukul 07.00 WIB.",
+      });
+    }
+
+    const fullContext =
+      typeof req.body?.fullContext === "string" ? req.body.fullContext.trim() : undefined;
+
+    try {
+      const prompt = buildEditSelectionPrompt({
+        selectedText: rawSelected,
+        action: rawAction,
+        fullContext,
+      });
+
+      const { result: rawText, modelUsed } = await callGeminiWithFallback(
+        async (modelName, signal) => {
+          recordGeminiCallAttempt();
+          const isThinkingCapable =
+            modelName === "gemini-3-flash-preview" ||
+            modelName.includes("preview") ||
+            modelName.includes("thinking");
+          const generationConfig: Record<string, any> = {
+            temperature: 0.35,
+            responseMimeType: "application/json",
+          };
+          if (isThinkingCapable) {
+            generationConfig.thinkingConfig = { thinkingBudget: 0 };
+          }
+          const model = genAI.getGenerativeModel({
+            model: modelName,
+            generationConfig,
+          });
+          const resp = await model.generateContent(prompt, { signal });
+          return resp.response.text();
+        },
+        {
+          purpose: "chat_edit_selection",
+          timeoutMs: 15_000,
+        }
+      );
+
+      const { revisedText } = parseEditSelectionJson(rawText, rawSelected);
+      const latencyMs = Date.now() - startMs;
+
+      log.info(
+        `[EDIT_SELECTION_METRICS] ${JSON.stringify({
+          action: rawAction,
+          inputLength: rawSelected.length,
+          outputLength: revisedText.length,
+          modelUsed,
+          latencyMs,
+        })}`
+      );
+
+      return res.status(200).json({
+        success: true,
+        revisedText,
+        data: { revisedText },
+      });
+    } catch (err: any) {
+      log.error("POST /api/chat/edit-selection failed", err);
+      reportCentralizedError(err, {
+        route: "/api/chat/edit-selection",
+        method: "POST",
+        ip: getClientIp(req),
+      });
+      return res.status(502).json({
+        success: false,
+        code: "edit_selection_failed",
+        error: "Gagal merevisi teks terpilih. Silakan coba lagi.",
+      });
+    }
+  }
+);
+
+// 6b-10. Internal Cost Guardian & Observability Metrics Endpoint: GET /api/internal/metrics
+app.get("/api/internal/metrics", (req: Request, res: Response) => {
+  const internalKey = (process.env.INTERNAL_METRICS_KEY || "").trim();
+  const providedKey = String(req.headers["x-internal-key"] || "").trim();
+  const isAllowed =
+    !IS_PRODUCTION || (Boolean(internalKey) && providedKey === internalKey);
+
+  if (!isAllowed) {
+    return res.status(403).json({
+      success: false,
+      code: "forbidden",
+      error: "Akses metrik internal tidak diizinkan.",
+    });
+  }
+
+  return res.status(200).json({
+    success: true,
+    ...getMetricsSummary(),
+  });
+});
+
+// 6b-11. Multimodal Vision Endpoint (Notes / Table / Quiz / Screenshot-to-Task): POST /api/chat/vision
+const VISION_ALLOWED_MIMES = new Set(["image/jpeg", "image/png", "image/webp"]);
+const VISION_ALLOWED_MODES = new Set(["notes", "table", "quiz", "tasks"]);
+const VISION_MAX_IMAGE_BYTES = 5 * 1024 * 1024; // 5MB
+
+app.post(
+  ["/api/chat/vision", "/api/chats/vision"],
+  chatGeminiLimiter,
+  express.json({ limit: "8mb" }),
+  axiomaRateLimiter("heavy"),
+  async (req: Request, res: Response) => {
+    const requestId = randomUUID().slice(0, 8);
+    const log = createLogger(requestId);
+    const startMs = Date.now();
+
+    const rawBase64Input =
+      typeof req.body?.imageBase64 === "string" ? req.body.imageBase64.trim() : "";
+    const rawMime =
+      typeof req.body?.mimeType === "string" ? req.body.mimeType.trim().toLowerCase() : "";
+    const rawMode =
+      typeof req.body?.mode === "string" ? req.body.mode.trim().toLowerCase() : "";
+    const instruction =
+      typeof req.body?.instruction === "string" ? req.body.instruction.trim().slice(0, 500) : "";
+    const language = resolveLanguageCode(req.body?.language);
+
+    if (!rawBase64Input) {
+      return res.status(400).json({
+        success: false,
+        code: "image_required",
+        error: "Field 'imageBase64' wajib diisi.",
+      });
+    }
+
+    if (!VISION_ALLOWED_MIMES.has(rawMime)) {
+      return res.status(400).json({
+        success: false,
+        code: "unsupported_mime_type",
+        error: "Tipe gambar harus salah satu dari: image/jpeg, image/png, atau image/webp.",
+      });
+    }
+
+    if (!VISION_ALLOWED_MODES.has(rawMode)) {
+      return res.status(400).json({
+        success: false,
+        code: "invalid_vision_mode",
+        error: "Field 'mode' harus salah satu dari: notes, table, quiz, atau tasks.",
+      });
+    }
+
+    // Strip optional data URL prefix (e.g. data:image/png;base64,...)
+    const cleanBase64 = rawBase64Input.replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/, "").trim();
+    const estimatedBytes = Math.floor((cleanBase64.length * 3) / 4);
+    if (estimatedBytes > VISION_MAX_IMAGE_BYTES) {
+      return res.status(400).json({
+        success: false,
+        code: "image_too_large",
+        error: "Ukuran gambar maksimal 5 MB.",
+      });
+    }
+
+    if (!canConsumeDailyGeminiQuota()) {
+      return res.status(503).json({
+        success: false,
+        code: "daily_quota_exceeded",
+        error: "Kuota AI hari ini sudah habis. Tersedia lagi pukul 07.00 WIB.",
+      });
+    }
+
+    const modePrompts: Record<string, string> = {
+      notes:
+        "Ubah foto papan tulis, slide, atau catatan tangan ini menjadi ringkasan poin Markdown yang rapi, terstruktur dengan heading singkat, dan mudah dipelajari.",
+      table:
+        "Ekstrak seluruh data pada gambar ini (misalnya struk belanja, jadwal, atau daftar harga) menjadi tabel Markdown yang rapi. Jika ada angka/nominal, sertakan baris total atau ringkasan singkat di bawah tabel.",
+      quiz:
+        "Buat TEPAT 5 soal latihan (pilihan ganda atau isian singkat) berdasarkan materi pada gambar ini. Cantumkan bagian 'Kunci Jawaban' secara terpisah di bagian paling bawah.",
+      tasks:
+        "Ekstrak seluruh jadwal, tenggat waktu, dan daftar aksi dari tangkapan layar percakapan/catatan ini menjadi checklist Markdown berurutan (`- [ ] ...`) yang konkret dan siap dieksekusi.",
+    };
+
+    const langDirective =
+      language === "auto"
+        ? "Gunakan Bahasa Indonesia yang jelas dan natural (atau ikuti bahasa dominan pada gambar)."
+        : `Gunakan kode bahasa: ${language}.`;
+
+    const visionPrompt = [
+      "Kamu adalah Axioma Vision, asisten analisis visual presisi.",
+      modePrompts[rawMode],
+      langDirective,
+      instruction ? `INSTRUKSI TAMBAHAN PENGGUNA: ${instruction}` : "",
+      "Jangan mengarang teks yang tidak terbaca; tandai dengan [tidak terbaca] jika ada bagian buram.",
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+
+    let modelUsed = "gemini-vision";
+    try {
+      const { result: visionOutcome, fallbackUsed } = await executeWithRecovery(
+        async () => {
+          return await callGeminiWithFallback(
+            async (modelName, signal) => {
+              recordGeminiCallAttempt();
+              const model = genAI.getGenerativeModel({ model: modelName });
+              const resp = await model.generateContent(
+                [
+                  { text: visionPrompt },
+                  {
+                    inlineData: {
+                      mimeType: rawMime,
+                      data: cleanBase64,
+                    },
+                  },
+                ],
+                { signal }
+              );
+              return resp.response.text();
+            },
+            {
+              purpose: `vision_${rawMode}`,
+              timeoutMs: 25_000,
+            }
+          );
+        },
+        undefined,
+        {
+          timeoutMs: 28_000,
+          recoveryMessage:
+            "Layanan analisis gambar sedang sibuk. Silakan coba kirim ulang gambar Anda.",
+        }
+      );
+
+      modelUsed = visionOutcome.modelUsed;
+      const resultText = (visionOutcome.result || "").trim();
+      const latencyMs = Date.now() - startMs;
+
+      recordFeatureMetric({
+        feature: `vision_${rawMode}`,
+        model: modelUsed,
+        latencyMs,
+        inputChars: visionPrompt.length + 1000,
+        outputChars: resultText.length,
+        fallbackUsed,
+      });
+
+      log.info(
+        `[VISION_METRICS] ${JSON.stringify({
+          mode: rawMode,
+          mimeType: rawMime,
+          imageBytes: estimatedBytes,
+          modelUsed,
+          latencyMs,
+          outputChars: resultText.length,
+        })}`
+      );
+
+      return res.status(200).json({
+        success: true,
+        result: resultText,
+        mode: rawMode,
+        data: {
+          result: resultText,
+          mode: rawMode,
+        },
+      });
+    } catch (err: any) {
+      const latencyMs = Date.now() - startMs;
+      recordFeatureMetric({
+        feature: `vision_${rawMode}`,
+        model: modelUsed,
+        latencyMs,
+        inputChars: visionPrompt.length,
+        outputChars: 0,
+        error: true,
+      });
+
+      if (err instanceof AiRecoveryError) {
+        return res.status(503).json({
+          success: false,
+          ...err.toPayload(),
+          error: err.message,
+        });
+      }
+
+      log.error("POST /api/chat/vision failed", err);
+      reportCentralizedError(err, {
+        route: "/api/chat/vision",
+        method: "POST",
+        ip: getClientIp(req),
+      });
+      return res.status(502).json({
+        success: false,
+        code: "AI_RECOVERY_NEEDED",
+        message: "Gagal menganalisis gambar. Silakan coba lagi.",
+        error: "Gagal menganalisis gambar. Silakan coba lagi.",
+        retryable: true,
+      });
+    }
+  }
+);
+
+// 6b-12. Bedah PDF Pintar Endpoint: POST /api/chat/analyze-pdf (and alias /api/chats/analyze-pdf)
+app.post(
+  ["/api/chat/analyze-pdf", "/api/chats/analyze-pdf"],
+  chatGeminiLimiter,
+  express.json({ limit: "12mb" }),
+  axiomaRateLimiter("heavy"),
+  async (req: Request, res: Response) => {
+    const requestId = randomUUID().slice(0, 8);
+    const log = createLogger(requestId);
+    const startMs = Date.now();
+
+    const pdfValidation = validatePdfBase64Payload(req.body?.pdfBase64);
+    if (!pdfValidation.valid || !pdfValidation.cleanBase64) {
+      return res.status(400).json({
+        success: false,
+        code: pdfValidation.code || "invalid_pdf",
+        error: pdfValidation.error || "Dokumen PDF tidak valid.",
+      });
+    }
+
+    const rawMode =
+      typeof req.body?.mode === "string" ? req.body.mode.trim().toLowerCase() : "";
+    if (!isValidPdfAnalysisMode(rawMode)) {
+      return res.status(400).json({
+        success: false,
+        code: "invalid_pdf_mode",
+        error:
+          "Field 'mode' harus salah satu dari: summary, glossary, critical_questions, atau ask.",
+      });
+    }
+
+    const question =
+      typeof req.body?.question === "string" ? req.body.question.trim() : "";
+    if (rawMode === "ask" && !question) {
+      return res.status(400).json({
+        success: false,
+        code: "question_required",
+        error: "Field 'question' wajib diisi untuk mode 'ask'.",
+      });
+    }
+
+    const fileName =
+      typeof req.body?.fileName === "string" && req.body.fileName.trim()
+        ? req.body.fileName.trim().slice(0, 140)
+        : undefined;
+    const language =
+      typeof req.body?.language === "string" ? req.body.language.trim() : undefined;
+
+    if (!canConsumeDailyGeminiQuota()) {
+      return res.status(503).json({
+        success: false,
+        code: "daily_quota_exceeded",
+        error: "Kuota AI hari ini sudah habis. Tersedia lagi pukul 07.00 WIB.",
+      });
+    }
+
+    const prompt = buildPdfAnalysisPrompt({
+      mode: rawMode,
+      fileName,
+      question: question || undefined,
+      language,
+    });
+
+    let modelUsed = "gemini-pdf";
+    try {
+      const { result: pdfOutcome, fallbackUsed } = await executeWithRecovery(
+        async () => {
+          return await callGeminiWithFallback(
+            async (modelName, signal) => {
+              recordGeminiCallAttempt();
+              const model = genAI.getGenerativeModel({ model: modelName });
+              const resp = await model.generateContent(
+                [
+                  { text: prompt },
+                  {
+                    inlineData: {
+                      mimeType: "application/pdf",
+                      data: pdfValidation.cleanBase64!,
+                    },
+                  },
+                ],
+                { signal }
+              );
+              return resp.response.text();
+            },
+            {
+              purpose: `pdf_${rawMode}`,
+              timeoutMs: 35_000,
+            }
+          );
+        },
+        undefined,
+        {
+          timeoutMs: 38_000,
+          recoveryMessage:
+            "Layanan analisis PDF sedang sibuk. Silakan coba unggah ulang dokumen Anda.",
+        }
+      );
+
+      modelUsed = pdfOutcome.modelUsed;
+      const resultText = (pdfOutcome.result || "").trim();
+      const latencyMs = Date.now() - startMs;
+
+      recordFeatureMetric({
+        feature: `pdf_${rawMode}`,
+        model: modelUsed,
+        latencyMs,
+        inputChars: prompt.length + 2000,
+        outputChars: resultText.length,
+        fallbackUsed,
+      });
+
+      log.info(
+        `[PDF_ANALYSIS_METRICS] ${JSON.stringify({
+          mode: rawMode,
+          fileName: fileName || "unnamed.pdf",
+          pdfBytes: pdfValidation.byteLength || 0,
+          modelUsed,
+          latencyMs,
+          outputChars: resultText.length,
+        })}`
+      );
+
+      return res.status(200).json({
+        success: true,
+        result: resultText,
+        mode: rawMode,
+        fileName,
+        data: {
+          result: resultText,
+          mode: rawMode,
+          fileName,
+        },
+      });
+    } catch (err: any) {
+      const latencyMs = Date.now() - startMs;
+      recordFeatureMetric({
+        feature: `pdf_${rawMode}`,
+        model: modelUsed,
+        latencyMs,
+        inputChars: prompt.length,
+        outputChars: 0,
+        error: true,
+      });
+
+      if (err instanceof AiRecoveryError) {
+        return res.status(503).json({
+          success: false,
+          ...err.toPayload(),
+          error: err.message,
+        });
+      }
+
+      log.error("POST /api/chat/analyze-pdf failed", err);
+      reportCentralizedError(err, {
+        route: "/api/chat/analyze-pdf",
+        method: "POST",
+        ip: getClientIp(req),
+      });
+      return res.status(502).json({
+        success: false,
+        code: "AI_RECOVERY_NEEDED",
+        message: "Gagal menganalisis dokumen PDF. Silakan coba lagi.",
+        error: "Gagal menganalisis dokumen PDF. Silakan coba lagi.",
+        retryable: true,
+      });
+    }
+  }
+);
+
+// 6b-13. Simulasi Roleplay Turn Endpoint: POST /api/chat/roleplay/turn
+app.post(
+  ["/api/chat/roleplay/turn", "/api/chats/roleplay/turn"],
+  chatGeminiLimiter,
+  express.json({ limit: "256kb" }),
+  axiomaRateLimiter("chat"),
+  async (req: Request, res: Response) => {
+    const requestId = randomUUID().slice(0, 8);
+    const log = createLogger(requestId);
+    const startMs = Date.now();
+
+    const persona = resolveRoleplayPersona(req.body?.persona);
+    const scenario =
+      typeof req.body?.scenario === "string" ? req.body.scenario.trim() : "";
+    const message =
+      typeof req.body?.message === "string" ? req.body.message.trim() : "";
+    const language =
+      typeof req.body?.language === "string" ? req.body.language.trim() : undefined;
+
+    if (!scenario) {
+      return res.status(400).json({
+        success: false,
+        code: "scenario_required",
+        error: "Field 'scenario' wajib diisi untuk memulai simulasi roleplay.",
+      });
+    }
+
+    if (!message) {
+      return res.status(400).json({
+        success: false,
+        code: "message_required",
+        error: "Field 'message' wajib diisi.",
+      });
+    }
+
+    if (!canConsumeDailyGeminiQuota()) {
+      return res.status(503).json({
+        success: false,
+        code: "daily_quota_exceeded",
+        error: "Kuota AI hari ini sudah habis. Tersedia lagi pukul 07.00 WIB.",
+      });
+    }
+
+    const history = sanitizeRoleplayHistory(req.body?.history);
+    const systemInstruction = buildRoleplayTurnSystemInstruction({
+      persona,
+      scenario,
+      language,
+    });
+
+    // Normalize alternating turns for Gemini
+    const contents: Content[] = [];
+    for (const turn of history) {
+      const prev = contents[contents.length - 1];
+      if (prev && prev.role === turn.role) {
+        const existingText = (prev.parts[0] as any)?.text || "";
+        prev.parts = [{ text: `${existingText}\n\n${turn.text}` }];
+      } else {
+        contents.push({ role: turn.role, parts: [{ text: turn.text }] });
+      }
+    }
+    const lastTurn = contents[contents.length - 1];
+    if (lastTurn && lastTurn.role === "user") {
+      const existingText = (lastTurn.parts[0] as any)?.text || "";
+      if (existingText !== message) {
+        lastTurn.parts = [{ text: `${existingText}\n\n${message}` }];
+      }
+    } else {
+      contents.push({ role: "user", parts: [{ text: message }] });
+    }
+    while (contents.length > 0 && contents[0].role !== "user") {
+      contents.shift();
+    }
+
+    let modelUsed = "gemini-roleplay";
+    try {
+      const { result: turnOutcome, fallbackUsed } = await executeWithRecovery(
+        async () => {
+          return await callGeminiWithFallback(
+            async (modelName, signal) => {
+              recordGeminiCallAttempt();
+              const model = genAI.getGenerativeModel({
+                model: modelName,
+                systemInstruction,
+                generationConfig: { temperature: 0.7 },
+              });
+              const resp = await model.generateContent({ contents }, { signal });
+              return resp.response.text();
+            },
+            {
+              purpose: "roleplay_turn",
+              timeoutMs: 20_000,
+            }
+          );
+        },
+        undefined,
+        {
+          timeoutMs: 24_000,
+          recoveryMessage: "Layanan roleplay sedang sibuk. Silakan kirim ulang pesan Anda.",
+        }
+      );
+
+      modelUsed = turnOutcome.modelUsed;
+      const reply = (turnOutcome.result || "").trim();
+      const latencyMs = Date.now() - startMs;
+
+      recordFeatureMetric({
+        feature: "roleplay_turn",
+        model: modelUsed,
+        latencyMs,
+        inputChars: systemInstruction.length + message.length,
+        outputChars: reply.length,
+        fallbackUsed,
+      });
+
+      log.info(
+        `[ROLEPLAY_METRICS] ${JSON.stringify({
+          action: "turn",
+          persona,
+          historyTurns: history.length,
+          modelUsed,
+          latencyMs,
+        })}`
+      );
+
+      return res.status(200).json({
+        success: true,
+        reply,
+        data: { reply },
+      });
+    } catch (err: any) {
+      const latencyMs = Date.now() - startMs;
+      recordFeatureMetric({
+        feature: "roleplay_turn",
+        model: modelUsed,
+        latencyMs,
+        inputChars: message.length,
+        outputChars: 0,
+        error: true,
+      });
+
+      if (err instanceof AiRecoveryError) {
+        return res.status(503).json({
+          success: false,
+          ...err.toPayload(),
+          error: err.message,
+        });
+      }
+
+      log.error("POST /api/chat/roleplay/turn failed", err);
+      reportCentralizedError(err, {
+        route: "/api/chat/roleplay/turn",
+        method: "POST",
+        ip: getClientIp(req),
+      });
+      return res.status(502).json({
+        success: false,
+        code: "AI_RECOVERY_NEEDED",
+        message: "Gagal melanjutkan simulasi roleplay. Silakan coba lagi.",
+        error: "Gagal melanjutkan simulasi roleplay. Silakan coba lagi.",
+        retryable: true,
+      });
+    }
+  }
+);
+
+// 6b-14. Simulasi Roleplay Final Report Endpoint: POST /api/chat/roleplay/report
+app.post(
+  ["/api/chat/roleplay/report", "/api/chats/roleplay/report"],
+  chatGeminiLimiter,
+  express.json({ limit: "256kb" }),
+  axiomaRateLimiter("chat"),
+  async (req: Request, res: Response) => {
+    const requestId = randomUUID().slice(0, 8);
+    const log = createLogger(requestId);
+    const startMs = Date.now();
+
+    const persona =
+      typeof req.body?.persona === "string" && req.body.persona.trim()
+        ? req.body.persona.trim().slice(0, 60)
+        : "hrd";
+    const scenario =
+      typeof req.body?.scenario === "string" ? req.body.scenario.trim() : "";
+    const history = sanitizeRoleplayHistory(req.body?.history);
+    const language =
+      typeof req.body?.language === "string" ? req.body.language.trim() : undefined;
+
+    if (history.length === 0) {
+      return res.status(400).json({
+        success: false,
+        code: "history_required",
+        error: "Minimal 1 percakapan diperlukan untuk membuat rapor evaluasi roleplay.",
+      });
+    }
+
+    if (!canConsumeDailyGeminiQuota()) {
+      return res.status(503).json({
+        success: false,
+        code: "daily_quota_exceeded",
+        error: "Kuota AI hari ini sudah habis. Tersedia lagi pukul 07.00 WIB.",
+      });
+    }
+
+    const prompt = buildRoleplayReportPrompt({
+      persona,
+      scenario: scenario || "Simulasi latihan komunikasi",
+      history,
+      language,
+    });
+
+    let modelUsed = "gemini-roleplay-report";
+    try {
+      const { result: reportOutcome, fallbackUsed } = await executeWithRecovery(
+        async () => {
+          return await callGeminiWithFallback(
+            async (modelName, signal) => {
+              recordGeminiCallAttempt();
+              const isThinkingCapable =
+                modelName === "gemini-3-flash-preview" ||
+                modelName.includes("preview") ||
+                modelName.includes("thinking");
+              const generationConfig: Record<string, any> = {
+                temperature: 0.35,
+                responseMimeType: "application/json",
+              };
+              if (isThinkingCapable) {
+                generationConfig.thinkingConfig = { thinkingBudget: 0 };
+              }
+              const model = genAI.getGenerativeModel({
+                model: modelName,
+                generationConfig,
+              });
+              const resp = await model.generateContent(prompt, { signal });
+              return resp.response.text();
+            },
+            {
+              purpose: "roleplay_report",
+              timeoutMs: 25_000,
+            }
+          );
+        },
+        undefined,
+        {
+          timeoutMs: 28_000,
+          recoveryMessage: "Gagal menyusun rapor evaluasi roleplay. Silakan coba lagi.",
+        }
+      );
+
+      modelUsed = reportOutcome.modelUsed;
+      const report = parseRoleplayReportJson(reportOutcome.result);
+      const latencyMs = Date.now() - startMs;
+
+      recordFeatureMetric({
+        feature: "roleplay_report",
+        model: modelUsed,
+        latencyMs,
+        inputChars: prompt.length,
+        outputChars: reportOutcome.result.length,
+        fallbackUsed,
+      });
+
+      log.info(
+        `[ROLEPLAY_METRICS] ${JSON.stringify({
+          action: "report",
+          persona,
+          historyTurns: history.length,
+          overallScore: report.overallScore,
+          grade: report.grade,
+          modelUsed,
+          latencyMs,
+        })}`
+      );
+
+      return res.status(200).json({
+        success: true,
+        ...report,
+        data: report,
+      });
+    } catch (err: any) {
+      const latencyMs = Date.now() - startMs;
+      recordFeatureMetric({
+        feature: "roleplay_report",
+        model: modelUsed,
+        latencyMs,
+        inputChars: prompt.length,
+        outputChars: 0,
+        error: true,
+      });
+
+      if (err instanceof AiRecoveryError) {
+        return res.status(503).json({
+          success: false,
+          ...err.toPayload(),
+          error: err.message,
+        });
+      }
+
+      log.error("POST /api/chat/roleplay/report failed", err);
+      reportCentralizedError(err, {
+        route: "/api/chat/roleplay/report",
+        method: "POST",
+        ip: getClientIp(req),
+      });
+      return res.status(502).json({
+        success: false,
+        code: "AI_RECOVERY_NEEDED",
+        message: "Gagal menyusun rapor evaluasi roleplay. Silakan coba lagi.",
+        error: "Gagal menyusun rapor evaluasi roleplay. Silakan coba lagi.",
+        retryable: true,
+      });
+    }
+  }
+);
+
 // 6c. Main Endpoint: POST /api/chats/message
 app.post(
   "/api/chats/message",
   chatGeminiLimiter,
+  axiomaRateLimiter("chat"),
   async (req: Request<{}, {}, SendMessageRequest>, res: Response<ApiResponse<string>>) => {
     const requestId = randomUUID().slice(0, 8);
     const log = createLogger(requestId);
@@ -2807,18 +4453,37 @@ app.post(
       }
     };
 
+    const writeSseEvent = (payload: Record<string, unknown>): boolean => {
+      if (!sseStarted || res.writableEnded || clientDisconnected) {
+        return false;
+      }
+      try {
+        res.write(`data: ${JSON.stringify(payload)}\n\n`);
+        return true;
+      } catch (writeErr: any) {
+        log.warn(`SSE write warning: ${writeErr?.message || writeErr}`);
+        return false;
+      }
+    };
+
     const sendJson = (status: number, body: ApiResponse<string>) => {
       stopHeartbeat();
       if (res.headersSent) {
         if (sseStarted && !res.writableEnded) {
-          res.write(
-            `data: ${JSON.stringify({
-              type: "error",
-              code: body.code || "error",
-              error: body.error || "Terjadi kesalahan.",
-            })}\n\n`
-          );
-          res.end();
+          try {
+            const errText = body.error || "Terjadi kesalahan.";
+            res.write(
+              `data: ${JSON.stringify({
+                type: "error",
+                code: body.code || "error",
+                error: errText,
+                message: errText,
+              })}\n\n`
+            );
+            res.end();
+          } catch {
+            // Stream already closed by client
+          }
         }
         return;
       }
@@ -2827,6 +4492,7 @@ app.post(
           body.agent_id ? ` agent=${body.agent_id}` : ""
         }${body.error ? ` error="${body.error}"` : ""}`
       );
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
       res.status(status).json(body);
     };
 
@@ -2910,8 +4576,76 @@ app.post(
         });
       }
 
-      const { chat_id, content, agent_id, regenerate, attachment_ids } = req.body || ({} as SendMessageRequest);
+      const {
+        chat_id,
+        content,
+        agent_id,
+        language: rawLanguage,
+        tone: rawTone,
+        answerStyle: rawAnswerStyle,
+        thinkingMode: rawThinkingMode,
+        contextSummary: rawContextSummary,
+        checkpoint: rawCheckpoint,
+        contextCorrection: rawContextCorrection,
+        socialTarget: rawSocialTarget,
+        taskBreakdownMode: rawTaskBreakdownMode,
+        workspaceContext: rawWorkspaceContext,
+        decisionHistory: rawDecisionHistory,
+        userProfile: rawUserProfile,
+        contextControl: rawContextControl,
+        requirementLock: rawRequirementLock,
+        regenerate,
+        attachment_ids,
+      } = req.body || ({} as SendMessageRequest);
       const agentProfile = resolveAgentProfile(agent_id);
+      const language = resolveLanguageCode(rawLanguage);
+      const tone = resolveToneStyle(rawTone);
+      const answerStyle = resolveAnswerStyle(rawAnswerStyle);
+      const thinkingMode = resolveThinkingMode(rawThinkingMode);
+      const socialTarget = resolveSocialTarget(rawSocialTarget);
+      const taskBreakdownMode = Boolean(rawTaskBreakdownMode);
+      const cleanContextSummary =
+        typeof rawContextSummary === "string" && rawContextSummary.trim()
+          ? rawContextSummary.trim()
+          : undefined;
+      const cleanCheckpoint = sanitizeCheckpoint(rawCheckpoint);
+      const cleanContextCorrection =
+        typeof rawContextCorrection === "string" && rawContextCorrection.trim()
+          ? rawContextCorrection.trim()
+          : undefined;
+      const cleanWorkspaceContext = sanitizeWorkspaceContext(rawWorkspaceContext);
+      const cleanDecisionHistory = sanitizeDecisionHistory(rawDecisionHistory);
+      const cleanUserProfile = sanitizeUserProfile(rawUserProfile);
+      const resolvedContextControl = sanitizeContextControl(rawContextControl);
+      const cleanRequirementLock = sanitizeRequirementLock(rawRequirementLock);
+      const rawMessageText = typeof content === "string" ? content : "";
+      const detectedIntent = detectIntent(rawMessageText);
+      const selfReviewActive = shouldActivateSelfReview(thinkingMode, detectedIntent);
+      const effectiveTaskBreakdown = shouldActivateTaskBreakdown(rawMessageText, taskBreakdownMode);
+      const hasCheckpoint = Boolean(cleanContextSummary || hasUsableCheckpoint(cleanCheckpoint));
+      const hasCorrection = Boolean(cleanContextCorrection);
+      const hasWorkspace = Boolean(cleanWorkspaceContext);
+      const hasUserProfile = Boolean(cleanUserProfile);
+      const decisionCount = cleanDecisionHistory.length;
+      const requirementLockCount = cleanRequirementLock.length;
+      const dynamicSystemInstruction = buildIntelligenceInstruction({
+        message: rawMessageText,
+        language,
+        tone,
+        answerStyle,
+        thinkingMode,
+        detectedIntent,
+        contextSummary: cleanContextSummary,
+        checkpoint: cleanCheckpoint,
+        contextCorrection: cleanContextCorrection,
+        socialTarget,
+        taskBreakdownMode: effectiveTaskBreakdown,
+        workspaceContext: cleanWorkspaceContext,
+        decisionHistory: cleanDecisionHistory,
+        userProfile: cleanUserProfile,
+        contextControl: resolvedContextControl,
+        requirementLock: cleanRequirementLock,
+      });
 
       const hasContent = typeof content === "string" && Boolean(content.trim());
       const rawAttachmentIds = Array.isArray(attachment_ids)
@@ -2919,7 +4653,9 @@ app.post(
         : [];
 
       log.info(
-        `START user=${user.id} ip=${clientIp} chat_id=${chat_id} agent=${agentProfile.id} regenerate=${Boolean(
+        `START user=${user.id} ip=${clientIp} chat_id=${chat_id} agent=${agentProfile.id} intent=${detectedIntent} language=${language} tone=${tone} answerStyle=${answerStyle} thinkingMode=${thinkingMode} socialTarget=${socialTarget} taskBreakdownMode=${effectiveTaskBreakdown} hasWorkspace=${hasWorkspace} hasUserProfile=${hasUserProfile} contextControl=${JSON.stringify(
+          resolvedContextControl
+        )} decisionCount=${decisionCount} hasCheckpoint=${hasCheckpoint} hasCorrection=${hasCorrection} selfReviewActive=${selfReviewActive} regenerate=${Boolean(
           regenerate
         )} stream=${wantsStream} content_length=${
           typeof content === "string" ? content.length : "n/a"
@@ -2972,6 +4708,40 @@ app.post(
 
       const isGuestMode = req.headers["x-guest-mode"] === "true" || !user.authenticated;
       const userContent = content.trim();
+
+      // 3b. Enforce Per-User Daily Credit Quota before DB/AI execution (authenticated users)
+      let userRemainingCredits: number | undefined;
+      if (!isGuestMode && user.authenticated) {
+        const preExplicitMediaMode = (req.body as any)?.media_mode;
+        const preMediaIntent =
+          preExplicitMediaMode === "image" || preExplicitMediaMode === "video"
+            ? ({ type: preExplicitMediaMode } as const)
+            : detectDirectMediaIntent(userContent, rawAttachmentIds.length > 0);
+        const quotaModelKey = resolveQuotaModelKey({
+          agentId: agentProfile.id,
+          engineMode: (req.body as any)?.engine_mode,
+          isMedia: Boolean(preMediaIntent && userContent),
+        });
+        const quotaCheck = await checkAndConsumeQuota(user.id, quotaModelKey);
+        res.setHeader("X-Axioma-Remaining-Credits", String(quotaCheck.remaining));
+        if (!quotaCheck.allowed) {
+          stopHeartbeat();
+          res.setHeader("Content-Type", "application/json; charset=utf-8");
+          return res.status(429).json({
+            success: false,
+            code: "QUOTA_EXCEEDED",
+            message: "Kuota kredit harian Anda tidak mencukupi untuk model ini.",
+            error: "Kuota kredit harian Anda tidak mencukupi untuk model ini.",
+            remaining: quotaCheck.remaining,
+            dailyCredits: quotaCheck.dailyCredits,
+            bonusCredits: quotaCheck.bonusCredits,
+            required: quotaCheck.required,
+            resetAt: quotaCheck.resetAt,
+            suggestedModel: "omni",
+          });
+        }
+        userRemainingCredits = quotaCheck.remaining;
+      }
 
       let existingChat: any = null;
       let chatTitle = DEFAULT_CHAT_TITLE;
@@ -3250,156 +5020,222 @@ app.post(
       }
 
       // Build normalized multi-turn Gemini contents (merges consecutive user messages) (#6, #12)
+      // Context Control: if useHistory === false, send ONLY the latest user message (clean conversation mode).
+      // Otherwise, when history > 10 messages and contextSummary is available, pass summary + latest 8 messages.
+      const effectiveSummaryForTrimming = cleanContextSummary || cleanCheckpoint?.summary;
+      const effectiveHistoryRows = !resolvedContextControl.useHistory
+        ? []
+        : historyRows.length > 10 && effectiveSummaryForTrimming
+        ? historyRows.slice(-8)
+        : historyRows;
       const promptText = userContent || "Analisis dan jelaskan isi berkas yang dilampirkan oleh pengguna.";
-      const geminiContents = buildNormalizedGeminiContents(historyRows, promptText, latestAttachmentParts);
+      const geminiContents = buildNormalizedGeminiContents(effectiveHistoryRows, promptText, latestAttachmentParts);
 
-      // Resolve AI Engine dynamically per request (auto | fast | pro) with automatic fallback
-      const requestedEngineMode =
-        (typeof req.body?.engine_mode === "string" && req.body.engine_mode.trim()) ||
-        (typeof req.body?.engineMode === "string" && req.body.engineMode.trim()) ||
-        "auto";
-      const requestedThinkingMode =
-        (typeof req.body?.thinking_mode === "string" && req.body.thinking_mode.trim()) ||
-        (typeof req.body?.thinkingMode === "string" && req.body.thinkingMode.trim()) ||
-        undefined;
-      const requestedTaskType =
-        (typeof req.body?.task_type === "string" && req.body.task_type.trim()) ||
-        (typeof req.body?.taskType === "string" && req.body.taskType.trim()) ||
-        "chat";
-      const resolvedEngine = resolveEngine({
-        requestedMode: requestedEngineMode,
-        taskType: requestedTaskType,
-        hasAttachment: rawAttachmentIds.length > 0 || latestAttachmentParts.length > 0,
-        thinkingMode: requestedThinkingMode,
-        agentId: agentProfile.id,
-      });
-      stageTimings.engine_mode = resolvedEngine.selectedMode;
-      stageTimings.engine_tier = resolvedEngine.resolvedTier;
-      stageTimings.engine_reason = resolvedEngine.reason;
-
-      // Step 3: Generate response using resolved AI Engine with a pre-assigned UUID for the AI message (#3, #4)
+      // Step 3: Generate response using Gemini API with a pre-assigned UUID for the AI message (#3, #4)
       const preGeneratedAiMsgId = randomUUID();
       let aiResponseText = "";
       let streamedTextSoFar = "";
-      let modelUsed: string = resolvedEngine.primaryModel;
+      let modelUsed: string = agentProfile.modelChain[0];
 
-      // Check for Media Generation Intent (Image or Video)
-      const isImageRequest = (req.body as any)?.media_mode === "image" || detectImageGenerationIntent(userContent);
-      const isVideoRequest = (req.body as any)?.media_mode === "video" || detectVideoGenerationIntent(userContent);
+      // Check for Direct or Manual Media Generation Intent (Image or Video)
+      const hasAttachment = latestAttachmentParts.length > 0 || effectiveAttachmentIds.length > 0;
+      const explicitMediaMode = (req.body as any)?.media_mode;
+      const directMediaIntent =
+        explicitMediaMode === "image" || explicitMediaMode === "video"
+          ? ({ type: explicitMediaMode } as const)
+          : detectDirectMediaIntent(userContent, hasAttachment);
+
+      const isImageRequest = directMediaIntent?.type === "image";
+      const isVideoRequest = directMediaIntent?.type === "video";
+      let mediaRevisedPrompt: string | undefined;
+      let mediaImageUrl: string | undefined;
+      let mediaVideoUrl: string | undefined;
+      let mediaResultType: "image" | "video" | undefined;
+      let mediaResultTitle: string | undefined;
+
+      const ensureSseStreamStarted = () => {
+        if (sseStarted || res.headersSent) return;
+        sseStarted = true;
+        res.status(200);
+        res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+        res.setHeader("Cache-Control", "no-cache, no-transform");
+        res.setHeader("Connection", "keep-alive");
+        res.setHeader("X-Accel-Buffering", "no");
+        res.flushHeaders?.();
+        writeSseEvent({
+          type: "meta",
+          user_message_id: insertedUserMessageId,
+          ai_message_id: preGeneratedAiMsgId,
+          message_id: preGeneratedAiMsgId,
+          agent_id: agentProfile.id,
+          agent_name: agentProfile.label,
+          chat: { id: trimmedChatId, title: chatTitle },
+        });
+        startHeartbeat();
+      };
 
       if (isImageRequest && userContent) {
         log.info(`STEP3 Media Intent: IMAGE generation for prompt="${userContent.slice(0, 50)}..."`);
-        modelUsed = "axioma-visual-engine";
+        modelUsed = "gemini-imagen-flux";
+
         if (wantsStream) {
-          if (!sseStarted && !res.headersSent) {
-            sseStarted = true;
-            res.status(200);
-            res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-            res.setHeader("Cache-Control", "no-cache, no-transform");
-            res.setHeader("Connection", "keep-alive");
-            res.setHeader("X-Accel-Buffering", "no");
-            res.flushHeaders?.();
-            res.write(
-              `data: ${JSON.stringify({
-                type: "meta",
-                user_message_id: insertedUserMessageId,
-                ai_message_id: preGeneratedAiMsgId,
-                message_id: preGeneratedAiMsgId,
-                agent_id: agentProfile.id,
-                agent_name: agentProfile.label,
-                chat: { id: trimmedChatId, title: chatTitle },
-              })}\n\n`
-            );
-            startHeartbeat();
+          ensureSseStreamStarted();
+          writeSseEvent({
+            type: "status",
+            text: "Membuat gambar sesuai permintaan...",
+          });
+        }
+
+        // 1. Strict visual prompt translation with safe fallback to original user message
+        resetWatchdog(REQUEST_WATCHDOG_MS);
+        let strictPrompt = userContent;
+        try {
+          const translated = await buildStrictVisualPrompt(userContent, "image");
+          if (translated && translated.trim()) {
+            strictPrompt = translated.trim();
           }
-
-          res.write(
-            `data: ${JSON.stringify({
-              type: "status",
-              text: "Merender gambar...",
-            })}\n\n`
+        } catch (promptErr: any) {
+          console.error(
+            "[POST /api/chats/message] buildStrictVisualPrompt(image) failed, falling back to original message:",
+            promptErr
           );
+          log.error("STEP3 IMAGE buildStrictVisualPrompt failed; using original userContent", promptErr);
+          strictPrompt = userContent;
+        }
 
-          const imgResult = await generateMediaImage(userContent);
+        // 2. Generate image with safe error handling so SSE/JSON contract is never broken abruptly
+        resetWatchdog(REQUEST_WATCHDOG_MS);
+        try {
+          const imgResult = await generateMediaImage(userContent, strictPrompt);
+          if (!imgResult?.url) {
+            throw new Error("Generator gambar tidak mengembalikan URL gambar yang valid.");
+          }
+          mediaRevisedPrompt = imgResult.revisedPrompt || strictPrompt;
+          mediaImageUrl = imgResult.url;
+          mediaResultType = "image";
           const cleanedSubj =
             (cleanUserPrompt(userContent) || "Gambar Visual")
               .replace(/[\r\n\[\]]+/g, " ")
               .trim() || "Gambar Visual";
+          mediaResultTitle = cleanedSubj;
 
           aiResponseText = `Berikut visualisasi untuk permintaan Anda:\n\n![${cleanedSubj}](${imgResult.url})`;
 
-          res.write(
-            `data: ${JSON.stringify({
+          if (wantsStream) {
+            writeSseEvent({
+              type: "image",
+              mediaType: "image",
+              imageUrl: imgResult.url,
+              url: imgResult.url,
+              mediaTitle: cleanedSubj,
+              revisedPrompt: mediaRevisedPrompt,
+              ai_message_id: preGeneratedAiMsgId,
+              message_id: preGeneratedAiMsgId,
+            });
+            writeSseEvent({
               type: "chunk",
               text: aiResponseText,
-            })}\n\n`
-          );
-        } else {
-          const imgResult = await generateMediaImage(userContent);
-          const cleanedSubj =
-            (cleanUserPrompt(userContent) || "Gambar Visual")
-              .replace(/[\r\n\[\]]+/g, " ")
-              .trim() || "Gambar Visual";
-
-          aiResponseText = `Berikut visualisasi untuk permintaan Anda:\n\n![${cleanedSubj}](${imgResult.url})`;
+              imageUrl: imgResult.url,
+              mediaType: "image",
+              mediaTitle: cleanedSubj,
+              revisedPrompt: mediaRevisedPrompt,
+              ai_message_id: preGeneratedAiMsgId,
+            });
+          }
+        } catch (mediaErr: any) {
+          console.error("[POST /api/chats/message] generateMediaImage failed:", mediaErr);
+          log.error("STEP3 IMAGE generation failed", mediaErr);
+          return sendJson(502, {
+            success: false,
+            code: "image_gen_failed",
+            error: "Gagal membuat gambar saat ini. Silakan coba lagi beberapa saat.",
+          });
         }
       } else if (isVideoRequest && userContent) {
         log.info(`STEP3 Media Intent: VIDEO generation for prompt="${userContent.slice(0, 50)}..."`);
         modelUsed = "axioma-video-engine";
+
         if (wantsStream) {
-          if (!sseStarted && !res.headersSent) {
-            sseStarted = true;
-            res.status(200);
-            res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-            res.setHeader("Cache-Control", "no-cache, no-transform");
-            res.setHeader("Connection", "keep-alive");
-            res.setHeader("X-Accel-Buffering", "no");
-            res.flushHeaders?.();
-            res.write(
-              `data: ${JSON.stringify({
-                type: "meta",
-                user_message_id: insertedUserMessageId,
-                ai_message_id: preGeneratedAiMsgId,
-                message_id: preGeneratedAiMsgId,
-                agent_id: agentProfile.id,
-                agent_name: agentProfile.label,
-                chat: { id: trimmedChatId, title: chatTitle },
-              })}\n\n`
-            );
-            startHeartbeat();
+          ensureSseStreamStarted();
+          writeSseEvent({
+            type: "status",
+            text: "Menyiapkan video sesuai permintaan...",
+          });
+        }
+
+        // 1. Strict visual prompt translation with safe fallback to original user message
+        resetWatchdog(REQUEST_WATCHDOG_MS);
+        let strictPrompt = userContent;
+        try {
+          const translated = await buildStrictVisualPrompt(userContent, "video");
+          if (translated && translated.trim()) {
+            strictPrompt = translated.trim();
           }
-
-          res.write(
-            `data: ${JSON.stringify({
-              type: "status",
-              text: "Merender video...",
-            })}\n\n`
+        } catch (promptErr: any) {
+          console.error(
+            "[POST /api/chats/message] buildStrictVisualPrompt(video) failed, falling back to original message:",
+            promptErr
           );
+          log.error("STEP3 VIDEO buildStrictVisualPrompt failed; using original userContent", promptErr);
+          strictPrompt = userContent;
+        }
 
-          const videoResult = await generateMediaVideo(userContent);
-          const cleanedSubj = cleanUserPrompt(userContent) || "Adegan Video";
-          const videoUrl = videoResult.videoUrl || "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4";
+        // 2. Generate video with safe error handling so SSE/JSON contract is never broken abruptly
+        resetWatchdog(REQUEST_WATCHDOG_MS);
+        try {
+          const videoResult = await generateMediaVideo(userContent, strictPrompt);
+          const videoUrl =
+            videoResult?.videoUrl ||
+            "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4";
+          mediaRevisedPrompt = videoResult?.revisedPrompt || strictPrompt;
+          mediaVideoUrl = videoUrl;
+          mediaResultType = "video";
+          const cleanedSubj =
+            (cleanUserPrompt(userContent) || "Adegan Video")
+              .replace(/[\r\n\[\]]+/g, " ")
+              .trim() || "Adegan Video";
+          mediaResultTitle = cleanedSubj;
 
           aiResponseText = `Berikut visualisasi untuk permintaan Anda:\n\n![video:${cleanedSubj}](${videoUrl})`;
 
-          res.write(
-            `data: ${JSON.stringify({
+          if (wantsStream) {
+            writeSseEvent({
+              type: "video",
+              mediaType: "video",
+              videoUrl,
+              url: videoUrl,
+              mediaTitle: cleanedSubj,
+              revisedPrompt: mediaRevisedPrompt,
+              ai_message_id: preGeneratedAiMsgId,
+              message_id: preGeneratedAiMsgId,
+            });
+            writeSseEvent({
               type: "chunk",
               text: aiResponseText,
-            })}\n\n`
-          );
-        } else {
-          const videoResult = await generateMediaVideo(userContent);
-          const cleanedSubj = cleanUserPrompt(userContent) || "Adegan Video";
-          const videoUrl = videoResult.videoUrl || "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4";
-
-          aiResponseText = `Berikut visualisasi untuk permintaan Anda:\n\n![video:${cleanedSubj}](${videoUrl})`;
+              videoUrl,
+              mediaType: "video",
+              mediaTitle: cleanedSubj,
+              revisedPrompt: mediaRevisedPrompt,
+              ai_message_id: preGeneratedAiMsgId,
+            });
+          }
+        } catch (mediaErr: any) {
+          console.error("[POST /api/chats/message] generateMediaVideo failed:", mediaErr);
+          log.error("STEP3 VIDEO generation failed", mediaErr);
+          return sendJson(502, {
+            success: false,
+            code: "video_gen_failed",
+            error: "Gagal menyiapkan video saat ini. Silakan coba lagi beberapa saat.",
+          });
         }
       } else {
         try {
           const voiceInstruction = req.body?.voice_mode
-            ? "MODE PERCAKAPAN SUARA (VOICE MODE): Anda sedang berbicara secara lisan langsung dengan pengguna dalam percakapan suara dua arah. Jawab dengan gaya bahasa lisan Bahasa Indonesia yang natural, hangat, langsung ke inti, dan ringkas (2–4 kalimat per giliran). DILARANG KERAS menggunakan format markdown (seperti *, **, #, `), poin angka/bullet, emotikon berlebihan, blok kode panjang, URL, atau tabel, karena jawaban ini akan langsung disuarakan dengan Text-To-Speech."
+            ? "MODE PERCAKAPAN SUARA (VOICE MODE): Anda sedang berbicara secara lisan langsung dengan pengguna dalam percakapan suara dua arah. Jawab dengan gaya bahasa lisan yang natural sesuai ATURAN BAHASA dan ATURAN GAYA BICARA (TONE) yang berlaku, hangat, langsung ke inti, dan ringkas (2–4 kalimat per giliran). DILARANG KERAS menggunakan format markdown (seperti *, **, #, `), poin angka/bullet, emotikon berlebihan, blok kode panjang, URL, atau tabel, karena jawaban ini akan langsung disuarakan dengan Text-To-Speech."
             : undefined;
+          const combinedSystemInstruction = voiceInstruction
+            ? `${dynamicSystemInstruction}\n\n${voiceInstruction}`
+            : dynamicSystemInstruction;
 
           if (wantsStream) {
             // Send SSE headers & meta event immediately, and start 15s heartbeat interval immediately (#1)
@@ -3441,8 +5277,7 @@ app.post(
                   res.write(`data: ${JSON.stringify({ type: "chunk", text: chunkText })}\n\n`);
                 }
               },
-              voiceInstruction,
-              resolvedEngine.modelChain
+              combinedSystemInstruction
             );
             aiResponseText = result.text;
             modelUsed = result.modelUsed;
@@ -3460,8 +5295,7 @@ app.post(
               log,
               agentProfile,
               undefined,
-              voiceInstruction,
-              resolvedEngine.modelChain
+              combinedSystemInstruction
             );
             aiResponseText = result.text;
             modelUsed = result.modelUsed;
@@ -3474,6 +5308,7 @@ app.post(
             stageTimings.ai_attempts = result.attempts;
           }
         } catch (aiError: any) {
+          console.error("[SSE_ERROR]", aiError);
           const partial = (
             (aiError instanceof AiGenerationError ? aiError.partialText : "") || streamedTextSoFar
           ).trim();
@@ -3561,9 +5396,79 @@ app.post(
         stageTimings.total_ms = Date.now() - reqStartMs;
       }
 
+      const latencyMs = Date.now() - reqStartMs;
+      stageTimings.total_ms = latencyMs;
+      stageTimings.intent = detectedIntent;
+      stageTimings.thinkingMode = thinkingMode;
+      stageTimings.answerStyle = answerStyle;
+      const estimatedInputChars =
+        dynamicSystemInstruction.length +
+        userContent.length +
+        effectiveHistoryRows.reduce((acc, r) => acc + (r.content ? r.content.length : 0), 0);
+      stageTimings.hasCheckpoint = hasCheckpoint;
+      stageTimings.hasCorrection = hasCorrection;
+      stageTimings.selfReviewActive = selfReviewActive;
+      stageTimings.socialTarget = socialTarget;
+      stageTimings.taskBreakdownMode = effectiveTaskBreakdown;
+      stageTimings.hasWorkspace = hasWorkspace;
+      stageTimings.hasUserProfile = hasUserProfile;
+      stageTimings.contextControl = resolvedContextControl;
+      stageTimings.requirementLockCount = requirementLockCount;
+      stageTimings.decisionCount = decisionCount;
+      stageTimings.estimatedInputChars = estimatedInputChars;
       log.info(`TIMINGS ${JSON.stringify(stageTimings)}`);
+      const routedModel = selectModel({
+        thinkingMode,
+        intent: detectedIntent,
+        language,
+        messageLength: rawMessageText.length,
+      });
+      recordFeatureMetric({
+        feature: "chat_message",
+        model: modelUsed || routedModel.selectedModel,
+        latencyMs,
+        inputChars: estimatedInputChars,
+        outputChars: aiResponseText.length,
+        fallbackUsed: Boolean(stageTimings.ai_fallback_count && stageTimings.ai_fallback_count > 0),
+      });
+      log.info(
+        `[INTELLIGENCE_METRICS] ${JSON.stringify({
+          intent: detectedIntent,
+          thinkingMode,
+          answerStyle,
+          language,
+          tone,
+          socialTarget,
+          taskBreakdownMode: effectiveTaskBreakdown,
+          hasWorkspace,
+          hasUserProfile,
+          contextControl: resolvedContextControl,
+          requirementLockCount,
+          decisionCount,
+          hasCheckpoint,
+          hasCorrection,
+          selfReviewActive,
+          routedModel: routedModel.selectedModel,
+          routedTier: routedModel.tier,
+          historyCount: historyRows.length,
+          sentHistoryCount: effectiveHistoryRows.length,
+          estimatedInputChars,
+          latencyMs,
+        })}`
+      );
 
       // Step 5: Finish response (modelUsed is logged on backend only, never sent to frontend)
+      const mediaMetaFields = {
+        ...(mediaImageUrl ? { imageUrl: mediaImageUrl } : {}),
+        ...(mediaVideoUrl ? { videoUrl: mediaVideoUrl } : {}),
+        ...(mediaResultType ? { mediaType: mediaResultType } : {}),
+        ...(mediaResultTitle ? { mediaTitle: mediaResultTitle } : {}),
+        ...(mediaRevisedPrompt ? { revisedPrompt: mediaRevisedPrompt } : {}),
+        ...(typeof userRemainingCredits === "number"
+          ? { remainingCredits: userRemainingCredits }
+          : {}),
+      };
+
       if (sseStarted) {
         stopHeartbeat();
         log.info(
@@ -3572,20 +5477,23 @@ app.post(
           }, ai_message_id=${finalAiMessageId})`
         );
         if (!res.writableEnded) {
-          res.write(
-            `data: ${JSON.stringify({
-              type: "done",
-              success: true,
-              data: aiResponseText,
-              agent_id: agentProfile.id,
-              agent_name: agentProfile.label,
-              message_id: finalAiMessageId,
-              ai_message_id: finalAiMessageId,
-              user_message_id: insertedUserMessageId,
-              chat: { id: trimmedChatId, title: chatTitle },
-            })}\n\n`
-          );
-          res.end();
+          writeSseEvent({
+            type: "done",
+            success: true,
+            data: aiResponseText,
+            agent_id: agentProfile.id,
+            agent_name: agentProfile.label,
+            message_id: finalAiMessageId,
+            ai_message_id: finalAiMessageId,
+            user_message_id: insertedUserMessageId,
+            ...mediaMetaFields,
+            chat: { id: trimmedChatId, title: chatTitle },
+          });
+          try {
+            res.end();
+          } catch {
+            // Stream already closed cleanly
+          }
         }
         return;
       }
@@ -3603,9 +5511,11 @@ app.post(
         message_id: finalAiMessageId,
         ai_message_id: finalAiMessageId,
         user_message_id: insertedUserMessageId,
+        ...mediaMetaFields,
         chat: { id: trimmedChatId, title: chatTitle },
       });
     } catch (error: any) {
+      console.error("[SSE_ERROR]", error);
       log.error("UNEXPECTED error processing chat message", error);
       if (isNewlyCreatedChat && !insertedUserMessageId && effectiveChatId) {
         log.warn(

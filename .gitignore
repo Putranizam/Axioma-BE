@@ -9,4 +9,6 @@ scripts/*.json
 *-backup.json
 test-*.json
 *.log
+logs/
+.data/
 coverage/

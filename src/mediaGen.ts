@@ -1,14 +1,33 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { callGeminiWithFallback } from "./geminiModels";
-import { getMediaEngineConfig, resolveEngine } from "./config/engineConfig";
+import { detectDirectMediaIntent } from "./utils/mediaIntentDetector";
+import {
+  buildStrictVisualPrompt,
+  stripVisualCommandPrefix,
+} from "./utils/strictVisualPrompt";
 
-const geminiApiKey = process.env.GEMINI_API_KEY || "";
-const genAI = geminiApiKey ? new GoogleGenerativeAI(geminiApiKey) : null;
+let cachedGenAI: GoogleGenerativeAI | null = null;
+let cachedGeminiKey = "";
+
+function getGeminiApiKey(): string {
+  return (process.env.GEMINI_API_KEY || "").trim();
+}
+
+function getGenAI(): GoogleGenerativeAI | null {
+  const key = getGeminiApiKey();
+  if (!key) return null;
+  if (!cachedGenAI || cachedGeminiKey !== key) {
+    cachedGeminiKey = key;
+    cachedGenAI = new GoogleGenerativeAI(key);
+  }
+  return cachedGenAI;
+}
 
 export interface GeneratedImageResult {
   url: string;
   source: "imagen-3" | "flux-hd";
   enhancedPrompt: string;
+  revisedPrompt: string;
   originalPrompt: string;
 }
 
@@ -17,177 +36,149 @@ export interface GeneratedVideoResult {
   videoUrl?: string;
   operationName?: string;
   enhancedPrompt: string;
+  revisedPrompt: string;
   originalPrompt: string;
+  searchKeywords?: string;
+  provider?: "veo-2" | "pexels" | "pixabay" | "wikimedia" | "fallback";
   message: string;
 }
 
 /**
  * Detects if a user prompt is asking to generate or create an image.
  */
-export function detectImageGenerationIntent(prompt: string): boolean {
-  if (!prompt || typeof prompt !== "string") return false;
-  const p = prompt.trim().toLowerCase();
-
-  // Negative checks: educational/explanatory questions about images/art should NOT trigger generation
-  if (
-    /^(apa|kenapa|mengapa|bagaimana|jelaskan|apakah|siapa|kapan|di mana|dimana)\b/i.test(p) &&
-    /\b(cara\s+menggambar|cara\s+melukis|definisi|pengertian|sejarah|arti|fungsi|maksud)\b/i.test(p)
-  ) {
-    return false;
-  }
-
-  const imageTriggers = [
-    // Standard command triggers: "buatkan gambar", "bikin foto", "generate visual", "tolong lukiskan", etc.
-    /\b(buatkan|buat|bikin|generate|lukiskan|lukis|gambarkan|gambari|gambarin|fotokan|render|ciptakan|hadirkan|desainkan)\s+(gambar|foto|lukisan|ilustrasi|visual|image|artwork|wallpaper|poster)\b/i,
-    // Verbs alone that inherently mean draw/paint/photograph: "lukiskan", "gambarkan", "gambarin", "fotokan"
-    /\b(lukiskan|gambarkan|gambari|gambarin|fotokan)\b/i,
-    // "minta/mau/ingin/butuh gambar/foto/lukisan/visual"
-    /\b(minta|mau|ingin|butuh|perlu|tolong|coba|bisa\s+(tolong\s+)?(buatkan|bikin|buat)?)\s+(gambar|foto|lukisan|ilustrasi|visual)\b/i,
-    // Direct requests: "gambar gajah", "foto pemandangan", "lukisan monalisa", "ilustrasi kota masa depan"
-    /^(gambar|foto|lukisan|ilustrasi|visual)\s+(tentang|dari|bertema|sebuah|seekor|seorang|suatu|suasana|pemandangan|karakter|[a-zA-Z0-9\s]+)$/i,
-    // "dalam bentuk/berupa/sebagai gambar/foto/ilustrasi/visual"
-    /\b(dalam bentuk|sebagai|berupa|menjadi)\s+(gambar|foto|lukisan|ilustrasi|visual)\b/i,
-    // Tag / prefix triggers
-    /\[mode:\s*(gambar|image|foto|visual)\]/i,
-    /^(gambar|foto|lukisan|ilustrasi|visual)\s*:\s*.+/i,
-  ];
-
-  return imageTriggers.some((rgx) => rgx.test(p));
+export function detectImageGenerationIntent(prompt: string, hasAttachment = false): boolean {
+  return detectDirectMediaIntent(prompt, hasAttachment)?.type === "image";
 }
 
 /**
  * Detects if a user prompt is asking to generate or create a video.
  */
-export function detectVideoGenerationIntent(prompt: string): boolean {
-  if (!prompt || typeof prompt !== "string") return false;
-  const p = prompt.trim().toLowerCase();
-
-  // Negative checks
-  if (
-    /^(apa|kenapa|mengapa|bagaimana|jelaskan|apakah|siapa|kapan|di mana|dimana)\b/i.test(p) &&
-    /\b(cara\s+membuat\s+video|definisi|pengertian|sejarah|arti|fungsi|maksud)\b/i.test(p)
-  ) {
-    return false;
-  }
-
-  const videoTriggers = [
-    // Standard command triggers: "buatkan video", "bikin animasi", "generate klip", etc.
-    /\b(buatkan|buat|bikin|generate|render|ciptakan|hadirkan|desainkan)\s+(video|animasi|klip|clip|motion|sinematik)\b/i,
-    // Verbs alone: "animasikan", "videokan"
-    /\b(animasikan|videokan)\b/i,
-    // "minta/mau/ingin/butuh video/animasi/klip"
-    /\b(minta|mau|ingin|butuh|perlu|tolong|coba|bisa\s+(tolong\s+)?(buatkan|bikin|buat)?)\s+(video|animasi|klip|sinematik)\b/i,
-    // Direct requests: "video ombak", "animasi kelinci", "klip pemandangan"
-    /^(video|animasi|klip|sinematik)\s+(tentang|dari|bertema|sebuah|seekor|seorang|suatu|suasana|pemandangan|karakter|[a-zA-Z0-9\s]+)$/i,
-    // "dalam bentuk/berupa/sebagai video/animasi"
-    /\b(dalam bentuk|sebagai|berupa|menjadi)\s+(video|animasi|klip)\b/i,
-    // Tag / prefix triggers
-    /\[mode:\s*(video|animasi|klip)\]/i,
-    /^(video|animasi|klip)\s*:\s*.+/i,
-  ];
-
-  return videoTriggers.some((rgx) => rgx.test(p));
+export function detectVideoGenerationIntent(prompt: string, hasAttachment = false): boolean {
+  return detectDirectMediaIntent(prompt, hasAttachment)?.type === "video";
 }
 
 /**
- * Cleans the user's prompt by removing command prefixes like "buatkan gambar..."
+ * Cleans the user's prompt by removing command prefixes and technical storyboard labels
+ * like `Characters:`, `Camera:`, `Visual:`, and noisy punctuation.
  */
 export function cleanUserPrompt(rawPrompt: string): string {
-  let cleaned = rawPrompt.trim();
-  cleaned = cleaned.replace(/^\[mode:\s*(gambar|image|video|animasi)\]\s*:?/i, "");
-  cleaned = cleaned.replace(/^(tolong|coba|bisa\s+(kamu\s+)?)?\s*(buatkan|buat|bikin|generate|lukiskan|lukis|gambarkan|gambarin|render|ciptakan|animasikan|videokan)\s*(gambar|foto|lukisan|ilustrasi|visual|image|artwork|wallpaper|poster|video|animasi|klip)?\s*(bertema|dengan tema|tema|topik|tentang|dari|sebuah|seekor|seorang|suatu|berupa|:)?\s*/i, "");
-  cleaned = cleaned.replace(/^(gambar|foto|lukisan|ilustrasi|video|animasi)\s*(bertema|dengan tema|tema|topik|tentang|dari|sebuah|seekor|seorang|suatu|:)\s*/i, "");
-  return cleaned.trim() || rawPrompt.trim();
+  return stripVisualCommandPrefix(rawPrompt)
+    .replace(/[()]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 /**
- * Axioma Auto-Prompt Enhancer:
- * Transforms short / raw prompts into ultra-detailed, cinematic, photorealistic 8K English prompts.
+ * Axioma Strict Visual Prompt Translator wrapper (delegates to `buildStrictVisualPrompt`).
  */
 export async function enhancePrompt(
   rawPrompt: string,
   mediaType: "image" | "video" = "image"
 ): Promise<string> {
-  const cleaned = cleanUserPrompt(rawPrompt);
-  if (!genAI || !cleaned) {
-    return cleaned;
-  }
+  return buildStrictVisualPrompt(rawPrompt, mediaType);
+}
 
-  const isVideo = mediaType === "video";
-  const systemInstruction = isVideo
-    ? `You are an expert visual director and cinematographer for Axioma high-end cinematic visual rendering.
-Your task is to transform the user's concept into an ultra-detailed, cinematic video scene description in English.
-Specify:
-- Subject actions, expressive movement, dynamic physical interactions
-- Camera choreography (e.g. smooth cinematic drone tracking shot, slow dolly in, 35mm anamorphic lens, steady tracking)
-- Environment, atmospheric depth, volumetric fog, realistic lighting (golden hour, neon glow, dramatic chiaroscuro)
-- Temporal pacing, motion fluidity, ultra high definition 4K/8K resolution
-RULES:
-1. Output ONLY the enhanced English visual prompt string.
-2. Never include quotation marks, markdown headings, prefixes like "Prompt:", or conversational text.
-3. Keep the prompt between 45 and 90 words, evocative and highly descriptive.`
-    : `You are an expert visual director and concept artist for Axioma ultra-detailed photorealistic 8K visual rendering.
-Your task is to transform the user's idea into an ultra-detailed, visually stunning, photorealistic 8K resolution image description in English.
-Specify:
-- Precise subject anatomy, clothing, textures, and posture
-- Environment, background depth, atmospheric conditions
-- Professional lighting: volumetric god rays, soft rim light, cinematic illumination, vibrant color harmony
-- Camera settings: shot on 85mm or 35mm lens, f/1.4 aperture, shallow depth of field, sharp focus, ray-tracing, Octane Render aesthetics
-RULES:
-1. Output ONLY the enhanced English visual prompt string.
-2. Never include quotation marks, markdown formatting, prefixes like "Prompt:", or introductory text.
-3. Keep the prompt between 40 and 90 words, vivid and professionally composed.`;
+const STOP_WORDS = new Set([
+  "a", "an", "the", "in", "on", "at", "of", "to", "for", "with", "and", "or", "by", "from",
+  "is", "are", "was", "were", "be", "been", "being", "as", "into", "over", "under", "through",
+  "cinematic", "shot", "shots", "camera", "close", "up", "medium", "wide", "slow", "pan",
+  "dolly", "tracking", "smooth", "lighting", "warm", "natural", "photorealistic", "detailed",
+  "high", "quality", "4k", "8k", "scene", "characters", "character", "video", "visual",
+  "prompt", "frame", "angle", "motion", "lens", "style", "mood", "atmosphere", "background",
+  "wearing", "neat", "clean", "modern", "looking", "while", "around", "near", "their", "his", "her",
+]);
 
-  try {
-    const result = await callGeminiWithFallback(
-      async (modelName, signal) => {
-        const model = genAI.getGenerativeModel({
-          model: modelName,
-          systemInstruction,
-          generationConfig: {
-            temperature: 0.6,
-            maxOutputTokens: 256,
-          },
-        });
-        const res = await model.generateContent({
-          contents: [{ role: "user", parts: [{ text: cleaned }] }],
-        });
-        const text = res.response.text().trim();
-        // Strip any accidental wrapping quotes
-        return text.replace(/^["'`]+|["'`]+$/g, "").trim();
-      },
-      {
-        customChain: resolveEngine({ requestedMode: "auto", taskType: "media_prompt" }).modelChain,
-        purpose: `media-prompt-enhancement-${mediaType}`,
-        timeoutMs: 8_000,
-      }
-    );
-
-    if (result.result && result.result.length > 10) {
-      return result.result;
+/**
+ * Deterministic fallback English keyword extractor when Gemini is unavailable.
+ */
+export function extractFallbackKeywords(text: string): string[] {
+  const words = text
+    .toLowerCase()
+    .replace(/[^a-z\s]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length >= 3 && !STOP_WORDS.has(w));
+  const unique: string[] = [];
+  for (const w of words) {
+    if (!unique.includes(w)) {
+      unique.push(w);
     }
-  } catch (err: any) {
-    console.warn(`[mediaGen] Prompt enhancement fallback to original due to:`, err?.message || err);
+    if (unique.length >= 4) break;
+  }
+  return unique;
+}
+
+/**
+ * Extracts 2–4 accurate English visual search keywords for Stock Video APIs (Pexels / Wikimedia)
+ * using 1 fast Gemini call, avoiding Indonesian queries or long sentence queries.
+ */
+export async function extractVideoSearchKeywords(promptText: string): Promise<string[]> {
+  const cleanInput = cleanUserPrompt(promptText);
+  if (!cleanInput) return ["office", "work"];
+
+  const aiClient = getGenAI();
+  if (aiClient) {
+    try {
+      const { result } = await callGeminiWithFallback(
+        async (modelName, signal) => {
+          const model = aiClient.getGenerativeModel({
+            model: modelName,
+            generationConfig: {
+              temperature: 0.1,
+              maxOutputTokens: 32,
+            },
+          });
+          const kwPrompt = [
+            "Extract 2 to 4 concrete English visual search keywords (nouns/actions only) to search a stock video library for this scene.",
+            "RULES:",
+            "- Output ONLY 2 to 4 lowercase English words separated by single spaces (e.g. `programmer computer office` or `barista pouring coffee cafe`).",
+            "- NO punctuation, NO quotes, NO Indonesian words, NO person names (like Budi/Ani), NO camera words (like cinematic/closeup/4k).",
+            "",
+            `SCENE: ${cleanInput.slice(0, 600)}`,
+          ].join("\n");
+          const resp = await model.generateContent(kwPrompt, { signal });
+          return resp.response.text().trim();
+        },
+        {
+          purpose: "video-stock-keyword-extraction",
+          timeoutMs: 6_000,
+        }
+      );
+
+      const tokens = (result || "")
+        .toLowerCase()
+        .replace(/[^a-z\s]/g, " ")
+        .split(/\s+/)
+        .filter((w) => w.length >= 2 && !STOP_WORDS.has(w))
+        .slice(0, 4);
+
+      if (tokens.length >= 2) {
+        return tokens;
+      }
+    } catch (err: any) {
+      console.warn("[mediaGen] Keyword extraction via Gemini failed, using local extractor:", err?.message || err);
+    }
   }
 
-  // Graceful fallback to original cleaned prompt
-  return cleaned;
+  const fallback = extractFallbackKeywords(cleanInput);
+  return fallback.length > 0 ? fallback : ["city", "people"];
 }
 
 /**
  * Generates an HD Image via Gemini Imagen 3 / Native Image Gen with seamless fallback to Pollinations Flux HD.
- * 100% Anti-Gagal guarantee.
+ * Uses `buildStrictVisualPrompt` (or a precomputed strict prompt) so 100% of user details are preserved.
  */
-export async function generateMediaImage(userPrompt: string): Promise<GeneratedImageResult> {
-  const enhancedPrompt = await enhancePrompt(userPrompt, "image");
+export async function generateMediaImage(
+  userPrompt: string,
+  precomputedStrictPrompt?: string
+): Promise<GeneratedImageResult> {
+  const strictPrompt =
+    (precomputedStrictPrompt || "").trim() ||
+    (await buildStrictVisualPrompt(userPrompt, "image"));
+  const geminiApiKey = getGeminiApiKey();
 
-  // 1. Try Google Imagen Predict API if API key is configured (model driven by ENGINE_IMAGE)
   if (geminiApiKey) {
     try {
-      const { imageModel } = getMediaEngineConfig();
-      const imagenUrl = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-        imageModel
-      )}:predict?key=${geminiApiKey}`;
+      const imagenUrl = `https://generativelanguage.googleapis.com/v1beta/models/imagen-3.0-generate-002:predict?key=${geminiApiKey}`;
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 12_000);
 
@@ -195,7 +186,7 @@ export async function generateMediaImage(userPrompt: string): Promise<GeneratedI
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          instances: [{ prompt: enhancedPrompt }],
+          instances: [{ prompt: strictPrompt }],
           parameters: {
             sampleCount: 1,
             aspectRatio: "1:1",
@@ -214,7 +205,8 @@ export async function generateMediaImage(userPrompt: string): Promise<GeneratedI
           return {
             url: `data:${mimeType};base64,${base64Data}`,
             source: "imagen-3",
-            enhancedPrompt,
+            enhancedPrompt: strictPrompt,
+            revisedPrompt: strictPrompt,
             originalPrompt: userPrompt,
           };
         }
@@ -232,15 +224,15 @@ export async function generateMediaImage(userPrompt: string): Promise<GeneratedI
     }
   }
 
-  // 2. High-Stability Visual Engine (12-15 core words, stripped of special characters/quotes)
-  const rawWords = (enhancedPrompt || cleanUserPrompt(userPrompt) || "scenic landscape")
-    .replace(/[^a-zA-Z0-9\s,.-]/g, " ")
+  // Keep full literal strict prompt details for Flux HD (bounded cleanly to safe URL length)
+  const sanitizedForUrl = (strictPrompt || cleanUserPrompt(userPrompt) || "scenic landscape")
+    .replace(/[^a-zA-Z0-9\s,.'-]/g, " ")
     .replace(/\s+/g, " ")
-    .trim()
-    .split(/\s+/)
-    .slice(0, 15)
-    .join(" ");
-  const cleanPrompt = rawWords || "beautiful world aesthetic photography";
+    .trim();
+  const cleanPrompt =
+    (sanitizedForUrl.length > 480
+      ? sanitizedForUrl.slice(0, 480).replace(/\s+\S*$/, "")
+      : sanitizedForUrl) || "beautiful world aesthetic photography";
   const seed = Math.floor(Math.random() * 1000000);
   const encodedPrompt = encodeURIComponent(cleanPrompt)
     .replace(/\(/g, "%28")
@@ -250,84 +242,261 @@ export async function generateMediaImage(userPrompt: string): Promise<GeneratedI
   return {
     url: fluxUrl,
     source: "flux-hd",
-    enhancedPrompt: cleanPrompt,
+    enhancedPrompt: strictPrompt || cleanPrompt,
+    revisedPrompt: strictPrompt || cleanPrompt,
     originalPrompt: userPrompt,
   };
 }
 
 /**
- * Helper to fetch a relevant video clip from Wikimedia Commons or CC0 video repository
+ * Optional Pexels Stock Video Search (active when PEXELS_API_KEY is configured in `.env`).
  */
-async function fetchMediaVideoFallback(query: string): Promise<string> {
-  const defaultVideoUrl = "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4";
-  if (!query || typeof query !== "string") return defaultVideoUrl;
+async function searchPexelsVideo(query: string): Promise<string | null> {
+  const pexelsKey = (process.env.PEXELS_API_KEY || "").trim();
+  if (!pexelsKey || !query.trim()) return null;
 
   try {
-    const searchTerms = query
-      .replace(/[^a-zA-Z0-9\s]/g, " ")
-      .trim()
-      .split(/\s+/)
-      .slice(0, 3)
-      .join(" ");
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 6_000);
+    const res = await fetch(
+      `https://api.pexels.com/videos/search?query=${encodeURIComponent(query)}&per_page=3&orientation=landscape`,
+      {
+        headers: { Authorization: pexelsKey },
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timer);
+    if (!res.ok) return null;
 
+    const data = (await res.json()) as any;
+    const videos = Array.isArray(data?.videos) ? data.videos : [];
+    for (const vid of videos) {
+      const files = Array.isArray(vid?.video_files) ? vid.video_files : [];
+      const hd =
+        files.find((f: any) => f?.file_type === "video/mp4" && f?.quality === "hd" && f?.link) ||
+        files.find((f: any) => f?.file_type === "video/mp4" && f?.link) ||
+        files[0];
+      if (hd?.link) return String(hd.link);
+    }
+  } catch (err: any) {
+    console.warn(`[mediaGen] Pexels search failed for "${query}":`, err?.message || err);
+  }
+  return null;
+}
+
+/**
+ * Optional Pixabay Stock Video Search (active when PIXABAY_API_KEY is configured in `.env`).
+ */
+async function searchPixabayVideo(query: string): Promise<string | null> {
+  const pixabayKey = (process.env.PIXABAY_API_KEY || "").trim();
+  if (!pixabayKey || !query.trim()) return null;
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 6_000);
+    const res = await fetch(
+      `https://pixabay.com/api/videos/?key=${encodeURIComponent(pixabayKey)}&q=${encodeURIComponent(query)}&per_page=3`,
+      { signal: controller.signal }
+    );
+    clearTimeout(timer);
+    if (!res.ok) return null;
+
+    const data = (await res.json()) as any;
+    const hits = Array.isArray(data?.hits) ? data.hits : [];
+    for (const hit of hits) {
+      const url =
+        hit?.videos?.medium?.url ||
+        hit?.videos?.small?.url ||
+        hit?.videos?.large?.url;
+      if (typeof url === "string" && url.startsWith("http")) {
+        return url;
+      }
+    }
+  } catch (err: any) {
+    console.warn(`[mediaGen] Pixabay search failed for "${query}":`, err?.message || err);
+  }
+  return null;
+}
+
+const NON_BROLL_TITLE_REGEX =
+  /\b(lecture|conference|talk|speech|tutorial|webinar|slides|presentation|podcast|interview|wikipedia|wiki|course|seminar|keynote)\b/i;
+
+/**
+ * Searches Wikimedia Commons for a matching CC0/open-license playable video clip (.mp4 / .webm),
+ * preferring B-roll footage over conference talks or slide presentations.
+ */
+async function searchWikimediaVideo(query: string): Promise<string | null> {
+  if (!query.trim()) return null;
+
+  try {
     const searchUrl = `https://commons.wikimedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(
-      searchTerms + " filetype:video webm"
-    )}&srnamespace=6&format=json`;
+      `${query} filetype:video`
+    )}&srnamespace=6&srlimit=10&format=json`;
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 6000);
+    const timer = setTimeout(() => controller.abort(), 6_000);
     const res = await fetch(searchUrl, {
-      headers: { "User-Agent": "AxiomaAI/1.0" },
+      headers: { "User-Agent": "AxiomaAI/1.0 (https://axioma.my.id)" },
       signal: controller.signal,
     });
     clearTimeout(timer);
 
-    if (res.ok) {
-      const data = (await res.json()) as any;
-      const hits = data?.query?.search || [];
-      for (const hit of hits.slice(0, 3)) {
-        const infoUrl = `https://commons.wikimedia.org/w/api.php?action=query&titles=${encodeURIComponent(
-          hit.title
-        )}&prop=imageinfo&iiprop=url|mime&format=json`;
-        const infoRes = await fetch(infoUrl, {
-          headers: { "User-Agent": "AxiomaAI/1.0" },
-        });
-        if (!infoRes.ok) continue;
-        const infoData = (await infoRes.json()) as any;
-        const pages = infoData?.query?.pages || {};
-        for (const k of Object.keys(pages)) {
-          const url = pages[k]?.imageinfo?.[0]?.url;
-          const mime = pages[k]?.imageinfo?.[0]?.mime;
-          if (
-            url &&
-            (mime?.includes("video") || url.endsWith(".webm") || url.endsWith(".mp4"))
-          ) {
-            return url;
-          }
-        }
+    if (!res.ok) return null;
+    const data = (await res.json()) as any;
+    const hits = Array.isArray(data?.query?.search) ? data.query.search : [];
+    if (hits.length === 0) return null;
+
+    // Sort visual B-roll candidates ahead of lecture/talk/tutorial recordings
+    const sortedTitles = hits
+      .map((h: any) => String(h?.title || ""))
+      .filter(Boolean)
+      .sort((a: string, b: string) => {
+        const aLecture = NON_BROLL_TITLE_REGEX.test(a) ? 1 : 0;
+        const bLecture = NON_BROLL_TITLE_REGEX.test(b) ? 1 : 0;
+        return aLecture - bLecture;
+      })
+      .slice(0, 8);
+
+    const titles = sortedTitles.join("|");
+    if (!titles) return null;
+
+    const infoController = new AbortController();
+    const infoTimer = setTimeout(() => infoController.abort(), 6_000);
+    const infoUrl = `https://commons.wikimedia.org/w/api.php?action=query&titles=${encodeURIComponent(
+      titles
+    )}&prop=imageinfo&iiprop=url|mime&format=json`;
+    const infoRes = await fetch(infoUrl, {
+      headers: { "User-Agent": "AxiomaAI/1.0 (https://axioma.my.id)" },
+      signal: infoController.signal,
+    });
+    clearTimeout(infoTimer);
+
+    if (!infoRes.ok) return null;
+    const infoData = (await infoRes.json()) as any;
+    const pages = infoData?.query?.pages || {};
+
+    // Rank candidates: B-roll .mp4 > B-roll .webm > other .mp4 > other .webm
+    const brollMp4: string[] = [];
+    const brollWebm: string[] = [];
+    const fallbackMp4: string[] = [];
+    const fallbackWebm: string[] = [];
+
+    for (const key of Object.keys(pages)) {
+      const pageTitle = String(pages[key]?.title || "");
+      const url = pages[key]?.imageinfo?.[0]?.url;
+      const mime = String(pages[key]?.imageinfo?.[0]?.mime || "").toLowerCase();
+      if (typeof url !== "string" || !url.startsWith("http")) continue;
+
+      const isLecture = NON_BROLL_TITLE_REGEX.test(pageTitle);
+      const isMp4 = url.endsWith(".mp4") || mime.includes("mp4");
+      const isWebm = url.endsWith(".webm") || mime.includes("webm");
+
+      if (isMp4) {
+        (isLecture ? fallbackMp4 : brollMp4).push(url);
+      } else if (isWebm) {
+        (isLecture ? fallbackWebm : brollWebm).push(url);
       }
     }
-  } catch (err) {
-    console.warn("[mediaGen] Video fallback search error, using default CC0 video:", err);
+
+    return brollMp4[0] || brollWebm[0] || fallbackMp4[0] || fallbackWebm[0] || null;
+  } catch (err: any) {
+    console.warn(`[mediaGen] Wikimedia search error for "${query}":`, err?.message || err);
   }
 
-  return defaultVideoUrl;
+  return null;
 }
 
 /**
- * Handles Video Generation via Google Veo 2 with 100% Anti-Gagal media rendering fallback.
+ * Progressive keyword search across Stock Video repositories (Pexels -> Pixabay -> Wikimedia Commons):
+ * 1. Tries full 2–4 extracted English visual keywords (e.g. "programmer computer office work").
+ * 2. If empty, trims to top 2 core keywords (e.g. "programmer office").
+ * 3. If still empty, tries top 1 core noun keyword (e.g. "office" / "computer").
+ * Never jumps straight to an unrelated random flower video on first miss.
  */
-export async function generateMediaVideo(userPrompt: string): Promise<GeneratedVideoResult> {
-  const enhancedPrompt = await enhancePrompt(userPrompt, "video");
-  const cleaned = cleanUserPrompt(userPrompt);
+async function fetchRelevantStockVideo(keywords: string[]): Promise<{
+  url: string;
+  matchedQuery: string;
+  provider: "pexels" | "pixabay" | "wikimedia" | "fallback";
+}> {
+  const uniqueKw = Array.from(new Set(keywords.map((k) => k.trim().toLowerCase()).filter(Boolean)));
+  const queriesToTry: string[] = [];
 
-  // 1. If Gemini API key is configured, try Google Veo predictLongRunning (model driven by ENGINE_VIDEO)
+  if (uniqueKw.length >= 3) {
+    queriesToTry.push(uniqueKw.slice(0, 4).join(" "));
+  }
+  if (uniqueKw.length >= 2) {
+    queriesToTry.push(uniqueKw.slice(0, 2).join(" "));
+  }
+  if (uniqueKw.length >= 1) {
+    queriesToTry.push(uniqueKw[0]);
+  }
+  if (uniqueKw.length >= 2 && uniqueKw[1] !== uniqueKw[0]) {
+    queriesToTry.push(uniqueKw[1]);
+  }
+
+  // 1. Try Pexels API first if configured
+  if ((process.env.PEXELS_API_KEY || "").trim()) {
+    for (const q of queriesToTry) {
+      const url = await searchPexelsVideo(q);
+      if (url) {
+        console.info(`[mediaGen] Matched Pexels stock video for query="${q}"`);
+        return { url, matchedQuery: q, provider: "pexels" };
+      }
+    }
+  }
+
+  // 2. Try Pixabay API if configured
+  if ((process.env.PIXABAY_API_KEY || "").trim()) {
+    for (const q of queriesToTry) {
+      const url = await searchPixabayVideo(q);
+      if (url) {
+        console.info(`[mediaGen] Matched Pixabay stock video for query="${q}"`);
+        return { url, matchedQuery: q, provider: "pixabay" };
+      }
+    }
+  }
+
+  // 3. Try Wikimedia Commons progressively (4 words -> 2 words -> 1 word)
+  for (const q of queriesToTry) {
+    const url = await searchWikimediaVideo(q);
+    if (url) {
+      console.info(`[mediaGen] Matched Wikimedia stock video for query="${q}"`);
+      return { url, matchedQuery: q, provider: "wikimedia" };
+    }
+  }
+
+  // 4. Last-resort safe fallback only after every progressive query returned zero results
+  console.warn(
+    `[mediaGen] All progressive video queries returned 0 hits (${queriesToTry.join(" | ")}); using CC0 fallback.`
+  );
+  return {
+    url: "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4",
+    matchedQuery: queriesToTry[0] || "",
+    provider: "fallback",
+  };
+}
+
+/**
+ * Handles Video Generation via Google Veo 2 (using strict literal English visual prompt)
+ * with intelligent English-keyword progressive Stock Video fallback (Pexels / Pixabay / Wikimedia Commons).
+ */
+export async function generateMediaVideo(
+  userPrompt: string,
+  precomputedStrictPrompt?: string
+): Promise<GeneratedVideoResult> {
+  // 1. Always transform raw/Indonesian/Studio prompt into 1 strict literal English visual paragraph first
+  const strictPrompt =
+    (precomputedStrictPrompt || "").trim() ||
+    (await buildStrictVisualPrompt(userPrompt, "video"));
+  // 2. Extract 2–4 crisp English visual keywords for stock video matching
+  const searchKeywordsArr = await extractVideoSearchKeywords(strictPrompt || userPrompt);
+  const searchKeywordsStr = searchKeywordsArr.join(" ");
+  const geminiApiKey = getGeminiApiKey();
+
+  // 3. If Gemini API key is configured, attempt Google Veo 2 predictLongRunning with strict English prompt
   if (geminiApiKey) {
     try {
-      const { videoModel } = getMediaEngineConfig();
-      const veoUrl = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-        videoModel
-      )}:predictLongRunning?key=${geminiApiKey}`;
+      const veoUrl = `https://generativelanguage.googleapis.com/v1beta/models/veo-2.0-generate-001:predictLongRunning?key=${geminiApiKey}`;
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 10_000);
 
@@ -335,7 +504,7 @@ export async function generateMediaVideo(userPrompt: string): Promise<GeneratedV
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          instances: [{ prompt: enhancedPrompt }],
+          instances: [{ prompt: strictPrompt }],
           parameters: {
             sampleCount: 1,
             aspectRatio: "16:9",
@@ -349,30 +518,36 @@ export async function generateMediaVideo(userPrompt: string): Promise<GeneratedV
       if (res.ok) {
         const data = (await res.json()) as any;
         if (data.name) {
+          const previewStock = await fetchRelevantStockVideo(searchKeywordsArr);
           return {
             status: "pending",
             operationName: data.name,
-            videoUrl: await fetchMediaVideoFallback(cleaned || enhancedPrompt),
-            enhancedPrompt,
+            videoUrl: previewStock.url,
+            enhancedPrompt: strictPrompt,
+            revisedPrompt: strictPrompt,
             originalPrompt: userPrompt,
+            searchKeywords: previewStock.matchedQuery || searchKeywordsStr,
+            provider: "veo-2",
             message: "Video sinematik sedang dirender.",
           };
         }
       }
-    } catch (veoErr) {
-      console.info("[mediaGen] Veo 2 unavailable, activating high-res cinematic video fallback.");
+    } catch {
+      console.info("[mediaGen] Veo 2 unavailable, activating progressive English stock video match.");
     }
   }
 
-  // 2. High-res cinematic video fallback (guaranteed playable video output)
-  const videoUrl = await fetchMediaVideoFallback(cleaned || enhancedPrompt);
+  // 4. Progressive stock video match using extracted English keywords (4 -> 2 -> 1 keywords)
+  const stockMatch = await fetchRelevantStockVideo(searchKeywordsArr);
 
   return {
     status: "completed",
-    videoUrl,
-    enhancedPrompt,
+    videoUrl: stockMatch.url,
+    enhancedPrompt: strictPrompt,
+    revisedPrompt: strictPrompt,
     originalPrompt: userPrompt,
+    searchKeywords: stockMatch.matchedQuery || searchKeywordsStr,
+    provider: stockMatch.provider,
     message: "Video berhasil dirender.",
   };
 }
-
