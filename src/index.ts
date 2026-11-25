@@ -41,14 +41,21 @@ import {
 } from "./mediaGen";
 import { detectDirectMediaIntent } from "./utils/mediaIntentDetector";
 import { buildStrictVisualPrompt } from "./utils/strictVisualPrompt";
-import { resolveQuotaModelKey } from "./config/quotaConfig";
+import {
+  MEDIA_TOKEN_COST,
+  MIN_TOKENS_TO_START,
+  resolveQuotaModelKey,
+  type QuotaModelKey,
+} from "./config/quotaConfig";
 import {
   bindQuotaSupabaseClient,
   getUserQuota,
-  checkAndConsumeQuota,
   prefetchUserQuotaState,
-  consumeQuotaFromPreflight,
+  checkTokenQuotaPreFlight,
+  recordTokenUsage,
+  estimateTokenCountFromChars,
   type PreflightUserQuotaState,
+  type TokenUsageSummary,
 } from "./services/quotaService";
 import { axiomaRateLimiter } from "./middleware/rateLimiter";
 import {
@@ -345,7 +352,7 @@ const corsOptions: cors.CorsOptions = {
     "Accept",
   ],
   exposedHeaders: [
-    "X-Axioma-Remaining-Credits",
+    "X-Axioma-Remaining-Tokens",
     "X-RateLimit-Limit",
     "X-RateLimit-Remaining",
     "Retry-After",
@@ -1130,13 +1137,17 @@ interface ApiResponse<T = any> {
   mediaType?: "image" | "video";
   mediaTitle?: string;
   revisedPrompt?: string;
-  remainingCredits?: number;
-  remaining?: number;
-  dailyCredits?: number;
-  bonusCredits?: number;
-  required?: number;
+  unit?: "token";
+  plan?: "free" | "pro";
+  dailyLimit?: number;
+  usedTokens?: number;
+  remainingTokens?: number;
+  bonusTokens?: number;
+  usagePercent?: number;
+  promptTokensUsed?: number;
+  completionTokensUsed?: number;
+  requiredTokens?: number;
   resetAt?: string;
-  suggestedModel?: string;
   chat?: { id: string; title: string; created_at?: string };
 }
 
@@ -1543,6 +1554,48 @@ export interface AiAttemptLog {
   first_chunk_ms?: number;
 }
 
+interface GeminiTokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
+
+function extractGeminiUsageMetadata(raw: any): GeminiTokenUsage | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const promptTokens =
+    typeof raw.promptTokenCount === "number" && Number.isFinite(raw.promptTokenCount)
+      ? Math.max(0, Math.trunc(raw.promptTokenCount))
+      : 0;
+  const candidatesTokens =
+    typeof raw.candidatesTokenCount === "number" && Number.isFinite(raw.candidatesTokenCount)
+      ? Math.max(0, Math.trunc(raw.candidatesTokenCount))
+      : 0;
+  const thoughtsTokens =
+    typeof raw.thoughtsTokenCount === "number" && Number.isFinite(raw.thoughtsTokenCount)
+      ? Math.max(0, Math.trunc(raw.thoughtsTokenCount))
+      : 0;
+  const totalCount =
+    typeof raw.totalTokenCount === "number" && Number.isFinite(raw.totalTokenCount)
+      ? Math.max(0, Math.trunc(raw.totalTokenCount))
+      : 0;
+
+  const completionTokens = Math.max(
+    candidatesTokens + thoughtsTokens,
+    totalCount > promptTokens ? totalCount - promptTokens : candidatesTokens
+  );
+  const totalTokens = Math.max(totalCount, promptTokens + completionTokens);
+
+  if (promptTokens === 0 && completionTokens === 0) {
+    return undefined;
+  }
+
+  return {
+    promptTokens,
+    completionTokens,
+    totalTokens,
+  };
+}
+
 /**
  * Generates an AI response using the selected agent's model chain and system instruction (#5, #7, #9).
  * - First-chunk timeout (`AI_FIRST_CHUNK_TIMEOUT_MS` = 5s) applies ONLY until the first chunk arrives.
@@ -1565,6 +1618,7 @@ async function generateWithFallbackAndRetry(
   fallbackCount: number;
   fallbackOverheadMs: number;
   attempts: AiAttemptLog[];
+  usage?: GeminiTokenUsage;
 }> {
   const setupDeadline = Date.now() + AI_TOTAL_SETUP_BUDGET_MS;
   const overallAiStart = Date.now();
@@ -1672,6 +1726,7 @@ async function generateWithFallbackAndRetry(
         firstChunkMs: number;
         streamMs: number;
         totalAiMs: number;
+        usage?: GeminiTokenUsage;
       }> => {
         if (onChunk) {
           const streamResult = await modelInstance.generateContentStream(
@@ -1679,11 +1734,16 @@ async function generateWithFallbackAndRetry(
             { signal: controller.signal }
           );
           // Prevent unhandled rejection from the SDK's internal secondary tee stream
-          streamResult.response.catch(() => {});
+          const safeResponsePromise = streamResult.response.catch(() => null);
+          let latestUsage: GeminiTokenUsage | undefined;
 
           for await (const chunk of streamResult.stream) {
             // Any incoming SSE packet from Gemini proves stream is alive; switch off first-chunk timer
             armChunkIdleTimer();
+            const chunkUsage = extractGeminiUsageMetadata((chunk as any)?.usageMetadata);
+            if (chunkUsage) {
+              latestUsage = chunkUsage;
+            }
             let piece = "";
             try {
               piece = chunk.text();
@@ -1714,6 +1774,13 @@ async function generateWithFallbackAndRetry(
           if (!fullText.trim()) {
             throw new Error("Gemini stream returned an empty response.");
           }
+          if (!latestUsage) {
+            const finalResp = await Promise.race([
+              safeResponsePromise,
+              new Promise<null>((resolve) => setTimeout(() => resolve(null), 150)),
+            ]);
+            latestUsage = extractGeminiUsageMetadata((finalResp as any)?.usageMetadata);
+          }
           const attemptElapsed = Date.now() - attemptStartedAt;
           return {
             text: fullText,
@@ -1721,6 +1788,7 @@ async function generateWithFallbackAndRetry(
             firstChunkMs,
             streamMs: Math.max(0, attemptElapsed - firstChunkMs),
             totalAiMs: Date.now() - overallAiStart,
+            usage: latestUsage,
           };
         } else {
           const result = await modelInstance.generateContent(
@@ -1732,6 +1800,7 @@ async function generateWithFallbackAndRetry(
           if (!text || !text.trim()) {
             throw new Error("Gemini returned an empty response.");
           }
+          const usage = extractGeminiUsageMetadata((result.response as any)?.usageMetadata);
           const elapsed = Date.now() - attemptStartedAt;
           return {
             text,
@@ -1739,6 +1808,7 @@ async function generateWithFallbackAndRetry(
             firstChunkMs: elapsed,
             streamMs: 0,
             totalAiMs: Date.now() - overallAiStart,
+            usage,
           };
         }
       };
@@ -1880,11 +1950,14 @@ async function generateWithFallbackAndRetry(
                 { contents: continuationContents },
                 { signal: fbController.signal }
               );
-              fbStream.response.catch(() => {});
+              const safeFbRespPromise = fbStream.response.catch(() => null);
+              let fbUsage: GeminiTokenUsage | undefined;
 
               let fbChunks = 0;
               for await (const fbChunk of fbStream.stream) {
                 resetFbTimer();
+                const chunkU = extractGeminiUsageMetadata((fbChunk as any)?.usageMetadata);
+                if (chunkU) fbUsage = chunkU;
                 let fbPiece = "";
                 try {
                   fbPiece = fbChunk.text();
@@ -1903,6 +1976,13 @@ async function generateWithFallbackAndRetry(
               parentSignal.removeEventListener("abort", onFbParentAbort);
 
               if (fbChunks > 0) {
+                if (!fbUsage) {
+                  const fbFinalResp = await Promise.race([
+                    safeFbRespPromise,
+                    new Promise<null>((resolve) => setTimeout(() => resolve(null), 150)),
+                  ]);
+                  fbUsage = extractGeminiUsageMetadata((fbFinalResp as any)?.usageMetadata);
+                }
                 const fbElapsed = Date.now() - fbStart;
                 modelCooldownUntil.delete(fallbackModel);
                 attempts.push({
@@ -1922,6 +2002,7 @@ async function generateWithFallbackAndRetry(
                   fallbackCount: attempts.length - 1,
                   fallbackOverheadMs: fallbackOverheadMs + fbElapsed,
                   attempts,
+                  usage: fbUsage,
                 };
               }
             } catch (fbErr: any) {
@@ -2133,7 +2214,7 @@ app.get("/api/health", (_req: Request, res: Response) => {
   return res.status(200).json({ ok: true });
 });
 
-// Daily Credit Quota Info Endpoint: GET /api/quota
+// Daily Token Quota Info Endpoint: GET /api/quota
 app.get("/api/quota", async (req: Request, res: Response) => {
   const requestId = randomUUID().slice(0, 8);
   const log = createLogger(requestId);
@@ -2149,7 +2230,7 @@ app.get("/api/quota", async (req: Request, res: Response) => {
     }
 
     const quota = await getUserQuota(user.id);
-    res.setHeader("X-Axioma-Remaining-Credits", String(quota.remainingCredits));
+    res.setHeader("X-Axioma-Remaining-Tokens", String(quota.remainingTokens));
     return res.status(200).json({
       success: true,
       authenticated: user.authenticated,
@@ -2160,7 +2241,7 @@ app.get("/api/quota", async (req: Request, res: Response) => {
     return res.status(500).json({
       success: false,
       code: "quota_lookup_failed",
-      error: "Gagal memuat informasi kuota kredit harian.",
+      error: "Gagal memuat informasi kuota token harian.",
     });
   }
 });
@@ -3251,26 +3332,34 @@ app.post(
 
     try {
       const { user } = await resolveRequestUser(req, log);
-      let remainingCredits: number | undefined;
+      let mediaPreflight: PreflightUserQuotaState | null = null;
       if (user?.authenticated) {
-        const quotaCheck = await checkAndConsumeQuota(user.id, "media");
-        res.setHeader("X-Axioma-Remaining-Credits", String(quotaCheck.remaining));
+        mediaPreflight = await prefetchUserQuotaState(user.id);
+        const quotaCheck = checkTokenQuotaPreFlight(mediaPreflight, {
+          modelKey: "media",
+          requiredTokens: MEDIA_TOKEN_COST,
+        });
+        res.setHeader("X-Axioma-Remaining-Tokens", String(quotaCheck.remainingTokens));
         if (!quotaCheck.allowed) {
           res.setHeader("Content-Type", "application/json; charset=utf-8");
           return res.status(429).json({
             success: false,
             code: "QUOTA_EXCEEDED",
-            message: "Kuota kredit harian Anda tidak mencukupi untuk model ini.",
-            error: "Kuota kredit harian Anda tidak mencukupi untuk model ini.",
-            remaining: quotaCheck.remaining,
-            dailyCredits: quotaCheck.dailyCredits,
-            bonusCredits: quotaCheck.bonusCredits,
-            required: quotaCheck.required,
+            message: "Kuota token harian Anda telah habis.",
+            error: "Kuota token harian Anda telah habis.",
+            unit: quotaCheck.unit,
+            plan: quotaCheck.plan,
+            dailyLimit: quotaCheck.dailyLimit,
+            usedTokens: quotaCheck.usedTokens,
+            remainingTokens: quotaCheck.remainingTokens,
+            bonusTokens: quotaCheck.bonusTokens,
+            usagePercent: quotaCheck.usagePercent,
+            promptTokensUsed: quotaCheck.promptTokensUsed,
+            completionTokensUsed: quotaCheck.completionTokensUsed,
+            requiredTokens: quotaCheck.requiredTokens,
             resetAt: quotaCheck.resetAt,
-            suggestedModel: "omni",
           });
         }
-        remainingCredits = quotaCheck.remaining;
       }
 
       log.info(`Generating image for prompt: "${prompt.slice(0, 50)}..." from ip=${clientIp}`);
@@ -3285,6 +3374,19 @@ app.post(
         log.warn(`buildStrictVisualPrompt fallback to raw prompt: ${promptErr?.message || promptErr}`);
       }
       const result = await generateMediaImage(prompt, strictPrompt);
+      let tokenSummary: TokenUsageSummary | null = null;
+      if (user?.authenticated) {
+        const promptEst = Math.min(MEDIA_TOKEN_COST, estimateTokenCountFromChars(prompt.length));
+        tokenSummary = recordTokenUsage(user.id, {
+          modelKey: "media",
+          promptTokens: promptEst,
+          completionTokens: Math.max(0, MEDIA_TOKEN_COST - promptEst),
+          fixedTotalTokens: MEDIA_TOKEN_COST,
+          source: "fixed_media",
+          preflight: mediaPreflight,
+        });
+        res.setHeader("X-Axioma-Remaining-Tokens", String(tokenSummary.remainingTokens));
+      }
       res.setHeader("Content-Type", "application/json; charset=utf-8");
       return res.status(200).json({
         success: true,
@@ -3295,7 +3397,20 @@ app.post(
         revisedPrompt: result.revisedPrompt,
         enhanced_prompt: result.enhancedPrompt,
         original_prompt: result.originalPrompt,
-        ...(typeof remainingCredits === "number" ? { remainingCredits } : {}),
+        ...(tokenSummary
+          ? {
+              unit: tokenSummary.unit,
+              plan: tokenSummary.plan,
+              dailyLimit: tokenSummary.dailyLimit,
+              usedTokens: tokenSummary.usedTokens,
+              remainingTokens: tokenSummary.remainingTokens,
+              bonusTokens: tokenSummary.bonusTokens,
+              usagePercent: tokenSummary.usagePercent,
+              promptTokensUsed: tokenSummary.promptTokensUsed,
+              completionTokensUsed: tokenSummary.completionTokensUsed,
+              resetAt: tokenSummary.resetAt,
+            }
+          : {}),
       });
     } catch (err: any) {
       console.error("[/api/generate/image] Image generation failed:", err);
@@ -3330,26 +3445,34 @@ app.post(
 
     try {
       const { user } = await resolveRequestUser(req, log);
-      let remainingCredits: number | undefined;
+      let mediaPreflight: PreflightUserQuotaState | null = null;
       if (user?.authenticated) {
-        const quotaCheck = await checkAndConsumeQuota(user.id, "media");
-        res.setHeader("X-Axioma-Remaining-Credits", String(quotaCheck.remaining));
+        mediaPreflight = await prefetchUserQuotaState(user.id);
+        const quotaCheck = checkTokenQuotaPreFlight(mediaPreflight, {
+          modelKey: "media",
+          requiredTokens: MEDIA_TOKEN_COST,
+        });
+        res.setHeader("X-Axioma-Remaining-Tokens", String(quotaCheck.remainingTokens));
         if (!quotaCheck.allowed) {
           res.setHeader("Content-Type", "application/json; charset=utf-8");
           return res.status(429).json({
             success: false,
             code: "QUOTA_EXCEEDED",
-            message: "Kuota kredit harian Anda tidak mencukupi untuk model ini.",
-            error: "Kuota kredit harian Anda tidak mencukupi untuk model ini.",
-            remaining: quotaCheck.remaining,
-            dailyCredits: quotaCheck.dailyCredits,
-            bonusCredits: quotaCheck.bonusCredits,
-            required: quotaCheck.required,
+            message: "Kuota token harian Anda telah habis.",
+            error: "Kuota token harian Anda telah habis.",
+            unit: quotaCheck.unit,
+            plan: quotaCheck.plan,
+            dailyLimit: quotaCheck.dailyLimit,
+            usedTokens: quotaCheck.usedTokens,
+            remainingTokens: quotaCheck.remainingTokens,
+            bonusTokens: quotaCheck.bonusTokens,
+            usagePercent: quotaCheck.usagePercent,
+            promptTokensUsed: quotaCheck.promptTokensUsed,
+            completionTokensUsed: quotaCheck.completionTokensUsed,
+            requiredTokens: quotaCheck.requiredTokens,
             resetAt: quotaCheck.resetAt,
-            suggestedModel: "omni",
           });
         }
-        remainingCredits = quotaCheck.remaining;
       }
 
       log.info(`Generating video design for prompt: "${prompt.slice(0, 50)}..." from ip=${clientIp}`);
@@ -3364,6 +3487,19 @@ app.post(
         log.warn(`buildStrictVisualPrompt fallback to raw prompt: ${promptErr?.message || promptErr}`);
       }
       const result = await generateMediaVideo(prompt, strictPrompt);
+      let tokenSummary: TokenUsageSummary | null = null;
+      if (user?.authenticated) {
+        const promptEst = Math.min(MEDIA_TOKEN_COST, estimateTokenCountFromChars(prompt.length));
+        tokenSummary = recordTokenUsage(user.id, {
+          modelKey: "media",
+          promptTokens: promptEst,
+          completionTokens: Math.max(0, MEDIA_TOKEN_COST - promptEst),
+          fixedTotalTokens: MEDIA_TOKEN_COST,
+          source: "fixed_media",
+          preflight: mediaPreflight,
+        });
+        res.setHeader("X-Axioma-Remaining-Tokens", String(tokenSummary.remainingTokens));
+      }
       res.setHeader("Content-Type", "application/json; charset=utf-8");
       return res.status(200).json({
         success: true,
@@ -3378,7 +3514,20 @@ app.post(
         search_keywords: result.searchKeywords,
         provider: result.provider,
         message: result.message,
-        ...(typeof remainingCredits === "number" ? { remainingCredits } : {}),
+        ...(tokenSummary
+          ? {
+              unit: tokenSummary.unit,
+              plan: tokenSummary.plan,
+              dailyLimit: tokenSummary.dailyLimit,
+              usedTokens: tokenSummary.usedTokens,
+              remainingTokens: tokenSummary.remainingTokens,
+              bonusTokens: tokenSummary.bonusTokens,
+              usagePercent: tokenSummary.usagePercent,
+              promptTokensUsed: tokenSummary.promptTokensUsed,
+              completionTokensUsed: tokenSummary.completionTokensUsed,
+              resetAt: tokenSummary.resetAt,
+            }
+          : {}),
       });
     } catch (err: any) {
       console.error("[/api/generate/video] Video generation failed:", err);
@@ -5096,9 +5245,13 @@ app.post(
         content: string;
         created_at: string;
       }> = [];
-      let userRemainingCredits: number | undefined;
-      let userDailyCredits: number | undefined;
-      let userBonusCredits: number | undefined;
+      let activeQuotaModelKey: QuotaModelKey = resolveQuotaModelKey({
+        agentId: agentProfile.id,
+        engineMode: (req.body as any)?.engine_mode,
+        isMedia: false,
+      });
+      let aiMeasuredTokenUsage: GeminiTokenUsage | undefined;
+      let tokenQuotaSummary: TokenUsageSummary | null = null;
 
       // Run Turnstile verification, quota prefetch, chat ownership lookup, and latest 24-message history in parallel
       log.info("STEP1 parallel preflight: Turnstile + quota + chat + recent history");
@@ -5187,39 +5340,46 @@ app.post(
           });
         }
 
-        // 3b. Commit per-user daily credit deduction synchronously from prefetched state (only after Turnstile & ownership pass)
+        // 3b. Pre-check per-user daily token quota before streaming starts (actual deduction happens after generation completes)
         if (user.authenticated && preflightQuota) {
           const preExplicitMediaMode = (req.body as any)?.media_mode;
           const preMediaIntent =
             preExplicitMediaMode === "image" || preExplicitMediaMode === "video"
               ? ({ type: preExplicitMediaMode } as const)
               : detectDirectMediaIntent(userContent, rawAttachmentIds.length > 0);
-          const quotaModelKey = resolveQuotaModelKey({
+          const isDirectMediaPrecheck = Boolean(preMediaIntent && userContent);
+          activeQuotaModelKey = resolveQuotaModelKey({
             agentId: agentProfile.id,
             engineMode: (req.body as any)?.engine_mode,
-            isMedia: Boolean(preMediaIntent && userContent),
+            isMedia: isDirectMediaPrecheck,
           });
-          const quotaCheck = consumeQuotaFromPreflight(preflightQuota, quotaModelKey);
-          res.setHeader("X-Axioma-Remaining-Credits", String(quotaCheck.remaining));
+          const requiredTokens = isDirectMediaPrecheck ? MEDIA_TOKEN_COST : MIN_TOKENS_TO_START;
+          const quotaCheck = checkTokenQuotaPreFlight(preflightQuota, {
+            modelKey: activeQuotaModelKey,
+            requiredTokens,
+          });
+          res.setHeader("X-Axioma-Remaining-Tokens", String(quotaCheck.remainingTokens));
           if (!quotaCheck.allowed) {
             stopHeartbeat();
             res.setHeader("Content-Type", "application/json; charset=utf-8");
             return res.status(429).json({
               success: false,
               code: "QUOTA_EXCEEDED",
-              message: "Kuota kredit harian Anda tidak mencukupi untuk model ini.",
-              error: "Kuota kredit harian Anda tidak mencukupi untuk model ini.",
-              remaining: quotaCheck.remaining,
-              dailyCredits: quotaCheck.dailyCredits,
-              bonusCredits: quotaCheck.bonusCredits,
-              required: quotaCheck.required,
+              message: "Kuota token harian Anda telah habis.",
+              error: "Kuota token harian Anda telah habis.",
+              unit: quotaCheck.unit,
+              plan: quotaCheck.plan,
+              dailyLimit: quotaCheck.dailyLimit,
+              usedTokens: quotaCheck.usedTokens,
+              remainingTokens: quotaCheck.remainingTokens,
+              bonusTokens: quotaCheck.bonusTokens,
+              usagePercent: quotaCheck.usagePercent,
+              promptTokensUsed: quotaCheck.promptTokensUsed,
+              completionTokensUsed: quotaCheck.completionTokensUsed,
+              requiredTokens: quotaCheck.requiredTokens,
               resetAt: quotaCheck.resetAt,
-              suggestedModel: "omni",
             });
           }
-          userRemainingCredits = quotaCheck.remaining;
-          userDailyCredits = quotaCheck.dailyCredits;
-          userBonusCredits = quotaCheck.bonusCredits;
         }
 
         chatTitle = existingChat?.title || DEFAULT_CHAT_TITLE;
@@ -5716,6 +5876,7 @@ app.post(
             );
             aiResponseText = result.text;
             modelUsed = result.modelUsed;
+            aiMeasuredTokenUsage = result.usage;
             stageTimings.ai_model_used = result.modelUsed;
             stageTimings.ai_fallback_count = result.fallbackCount;
             stageTimings.ai_fallback_overhead_ms = result.fallbackOverheadMs;
@@ -5734,6 +5895,7 @@ app.post(
             );
             aiResponseText = result.text;
             modelUsed = result.modelUsed;
+            aiMeasuredTokenUsage = result.usage;
             stageTimings.ai_model_used = result.modelUsed;
             stageTimings.ai_fallback_count = result.fallbackCount;
             stageTimings.ai_fallback_overhead_ms = result.fallbackOverheadMs;
@@ -5747,6 +5909,21 @@ app.post(
           const partial = (
             (aiError instanceof AiGenerationError ? aiError.partialText : "") || streamedTextSoFar
           ).trim();
+
+          // Fair fallback token accounting when stream is aborted/interrupted after emitting partial text
+          if (user.authenticated && !isGuestMode && partial.length > 0) {
+            const partialInputChars =
+              dynamicSystemInstruction.length +
+              userContent.length +
+              effectiveHistoryRows.reduce((acc, r) => acc + (r.content ? r.content.length : 0), 0);
+            recordTokenUsage(user.id, {
+              modelKey: activeQuotaModelKey,
+              promptTokens: Math.max(1, estimateTokenCountFromChars(partialInputChars)),
+              completionTokens: Math.max(1, estimateTokenCountFromChars(partial.length)),
+              source: "estimated",
+              preflight: preflightQuota,
+            });
+          }
 
           // #6 & #8: Keep user + AI messages consistent on stream failure or user stop:
           // - If partial text was generated OR client explicitly stopped generation, save the AI message
@@ -5893,6 +6070,49 @@ app.post(
         })}`
       );
 
+      // Step 4b: Record real (or fallback-estimated) token usage for authenticated users
+      if (user.authenticated && !isGuestMode) {
+        const usedDirectMedia = Boolean(
+          (isImageRequest || isVideoRequest) && (mediaImageUrl || mediaVideoUrl)
+        );
+        if (usedDirectMedia) {
+          const mediaPromptEst = Math.min(
+            MEDIA_TOKEN_COST,
+            estimateTokenCountFromChars(userContent.length)
+          );
+          tokenQuotaSummary = recordTokenUsage(user.id, {
+            modelKey: "media",
+            promptTokens: mediaPromptEst,
+            completionTokens: Math.max(0, MEDIA_TOKEN_COST - mediaPromptEst),
+            fixedTotalTokens: MEDIA_TOKEN_COST,
+            source: "fixed_media",
+            preflight: preflightQuota,
+          });
+        } else if (
+          aiMeasuredTokenUsage &&
+          (aiMeasuredTokenUsage.promptTokens > 0 || aiMeasuredTokenUsage.completionTokens > 0)
+        ) {
+          tokenQuotaSummary = recordTokenUsage(user.id, {
+            modelKey: activeQuotaModelKey,
+            promptTokens: aiMeasuredTokenUsage.promptTokens,
+            completionTokens: aiMeasuredTokenUsage.completionTokens,
+            source: "gemini",
+            preflight: preflightQuota,
+          });
+        } else {
+          tokenQuotaSummary = recordTokenUsage(user.id, {
+            modelKey: activeQuotaModelKey,
+            promptTokens: Math.max(1, estimateTokenCountFromChars(estimatedInputChars)),
+            completionTokens: Math.max(1, estimateTokenCountFromChars(aiResponseText.length)),
+            source: "estimated",
+            preflight: preflightQuota,
+          });
+        }
+        if (!sseStarted && !res.headersSent) {
+          res.setHeader("X-Axioma-Remaining-Tokens", String(tokenQuotaSummary.remainingTokens));
+        }
+      }
+
       // Step 5: Finish response (modelUsed is logged on backend only, never sent to frontend)
       const mediaMetaFields = {
         ...(mediaImageUrl ? { imageUrl: mediaImageUrl } : {}),
@@ -5900,14 +6120,19 @@ app.post(
         ...(mediaResultType ? { mediaType: mediaResultType } : {}),
         ...(mediaResultTitle ? { mediaTitle: mediaResultTitle } : {}),
         ...(mediaRevisedPrompt ? { revisedPrompt: mediaRevisedPrompt } : {}),
-        ...(typeof userRemainingCredits === "number"
-          ? { remainingCredits: userRemainingCredits }
-          : {}),
-        ...(typeof userDailyCredits === "number"
-          ? { dailyCredits: userDailyCredits }
-          : {}),
-        ...(typeof userBonusCredits === "number"
-          ? { bonusCredits: userBonusCredits }
+        ...(tokenQuotaSummary
+          ? {
+              unit: tokenQuotaSummary.unit,
+              plan: tokenQuotaSummary.plan,
+              dailyLimit: tokenQuotaSummary.dailyLimit,
+              usedTokens: tokenQuotaSummary.usedTokens,
+              remainingTokens: tokenQuotaSummary.remainingTokens,
+              bonusTokens: tokenQuotaSummary.bonusTokens,
+              usagePercent: tokenQuotaSummary.usagePercent,
+              promptTokensUsed: tokenQuotaSummary.promptTokensUsed,
+              completionTokensUsed: tokenQuotaSummary.completionTokensUsed,
+              resetAt: tokenQuotaSummary.resetAt,
+            }
           : {}),
       };
 

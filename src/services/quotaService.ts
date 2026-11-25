@@ -2,65 +2,96 @@ import fs from "fs";
 import path from "path";
 import { SupabaseClient } from "@supabase/supabase-js";
 import {
-  DAILY_FREE_CREDITS,
-  MODEL_CREDIT_COST,
+  MEDIA_TOKEN_COST,
+  MIN_TOKENS_TO_START,
+  MODEL_TOKEN_MULTIPLIER,
   PLAN_TIERS,
+  TOPUP_TOKEN_PACKS,
   QuotaModelKey,
   QuotaPlanId,
+  getDailyTokenLimitForPlan,
 } from "../config/quotaConfig";
 
 const WIB_OFFSET_MS = 7 * 60 * 60 * 1000; // UTC+7 (Waktu Indonesia Barat)
-const UNLIMITED_CREDITS_DISPLAY = 999_999;
 
-export interface UserQuotaSnapshot {
+export type TokenMeasurementSource = "gemini" | "estimated" | "fixed_media";
+
+export interface TokenUsageSummary {
   plan: QuotaPlanId;
-  unlimited: boolean;
-  remainingCredits: number;
-  dailyCredits: number;
-  bonusCredits: number;
+  unit: "token";
   dailyLimit: number;
-  usedToday: number;
+  usedTokens: number;
+  remainingTokens: number;
+  bonusTokens: number;
+  usagePercent: number;
+  promptTokensUsed: number;
+  completionTokensUsed: number;
   resetAt: string;
-  expiresAt?: string;
-  costs: typeof MODEL_CREDIT_COST;
-  tiers: typeof PLAN_TIERS;
+  lastRequestTokens?: {
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+    multiplier: number;
+    source: TokenMeasurementSource;
+  };
 }
 
-export type QuotaCheckResult =
+export interface UserQuotaSnapshot extends TokenUsageSummary {
+  expiresAt?: string;
+  minTokensToStart: number;
+  mediaTokenCost: number;
+  weights: typeof MODEL_TOKEN_MULTIPLIER;
+  tiers: typeof PLAN_TIERS;
+  topupPacks: typeof TOPUP_TOKEN_PACKS;
+}
+
+export type TokenPreFlightResult =
   | {
       allowed: true;
       plan: QuotaPlanId;
-      remaining: number;
-      dailyCredits: number;
-      bonusCredits: number;
-      required: number;
+      unit: "token";
+      dailyLimit: number;
+      usedTokens: number;
+      remainingTokens: number;
+      bonusTokens: number;
+      usagePercent: number;
+      promptTokensUsed: number;
+      completionTokensUsed: number;
+      requiredTokens: number;
       resetAt: string;
     }
   | {
       allowed: false;
       code: "QUOTA_EXCEEDED";
       plan: QuotaPlanId;
-      required: number;
-      remaining: number;
-      dailyCredits: number;
-      bonusCredits: number;
+      unit: "token";
+      dailyLimit: number;
+      usedTokens: number;
+      remainingTokens: number;
+      bonusTokens: number;
+      usagePercent: number;
+      promptTokensUsed: number;
+      completionTokensUsed: number;
+      requiredTokens: number;
       resetAt: string;
-      suggestedModel: "omni";
     };
 
-interface DailyUsageRecord {
+interface DailyTokenUsageRecord {
   userId: string;
   dateWib: string;
-  dailyCredits: number;
-  usedCredits: number;
+  dailyTokenLimit: number;
+  tokensUsed: number;
+  promptTokensUsed: number;
+  completionTokensUsed: number;
   updatedAt: string;
 }
 
-interface PersistedQuotaFile {
+interface PersistedTokenQuotaFile {
+  version: 2;
   plans: Record<string, QuotaPlanId>;
   proExpiresAt?: Record<string, string>;
-  bonusCredits: Record<string, number>;
-  dailyUsage: Record<string, DailyUsageRecord>;
+  bonusTokens: Record<string, number>;
+  dailyTokenUsage: Record<string, DailyTokenUsageRecord>;
 }
 
 const DATA_DIR = path.resolve(process.cwd(), ".data");
@@ -70,12 +101,17 @@ const QUOTA_CACHE_CLEANUP_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
 const LOCAL_PERSIST_DEBOUNCE_MS = 2_000;
 
 // Fast in-memory cache keyed by `${userId}:${YYYY-MM-DD_WIB}`
-const dailyUsageMap = new Map<string, DailyUsageRecord>();
+const dailyTokenUsageMap = new Map<string, DailyTokenUsageRecord>();
 const userPlanMap = new Map<string, QuotaPlanId>();
 const userProExpiresAtMap = new Map<string, string>();
-const userBonusCreditsMap = new Map<string, number>();
+const userBonusTokensMap = new Map<string, number>();
 
-function setBoundedMap<K, V>(map: Map<K, V>, key: K, value: V, maxEntries = MAX_QUOTA_CACHE_ENTRIES): void {
+function setBoundedMap<K, V>(
+  map: Map<K, V>,
+  key: K,
+  value: V,
+  maxEntries = MAX_QUOTA_CACHE_ENTRIES
+): void {
   if (map.has(key)) {
     map.delete(key);
   } else if (map.size >= maxEntries) {
@@ -89,12 +125,17 @@ function setBoundedMap<K, V>(map: Map<K, V>, key: K, value: V, maxEntries = MAX_
 
 function cleanupQuotaMaps(now: Date = new Date()): void {
   const todayWib = getWibDateKey(now);
-  for (const [key, rec] of dailyUsageMap.entries()) {
+  for (const [key, rec] of dailyTokenUsageMap.entries()) {
     if (rec.dateWib !== todayWib) {
-      dailyUsageMap.delete(key);
+      dailyTokenUsageMap.delete(key);
     }
   }
-  for (const map of [dailyUsageMap, userPlanMap, userProExpiresAtMap, userBonusCreditsMap] as Array<Map<string, unknown>>) {
+  for (const map of [
+    dailyTokenUsageMap,
+    userPlanMap,
+    userProExpiresAtMap,
+    userBonusTokensMap,
+  ] as Array<Map<string, unknown>>) {
     while (map.size > MAX_QUOTA_CACHE_ENTRIES) {
       const oldestKey = map.keys().next().value;
       if (oldestKey === undefined) break;
@@ -117,14 +158,54 @@ let localPersistQueuedAgain = false;
 let storeHydrated = false;
 let supabaseRef: SupabaseClient | null = null;
 let supabaseQuotaTableAvailable: boolean | null = null;
+let supabaseTokenColumnsAvailable: boolean | null = null;
+
+function isMissingTableError(error: { code?: string; message?: string } | null | undefined): boolean {
+  if (!error) return false;
+  const msg = String(error.message || "").toLowerCase();
+  return (
+    error.code === "42P01" ||
+    error.code === "PGRST205" ||
+    msg.includes("relation") && msg.includes("does not exist") ||
+    msg.includes("could not find the table")
+  );
+}
+
+function isMissingColumnError(error: { code?: string; message?: string } | null | undefined): boolean {
+  if (!error) return false;
+  const msg = String(error.message || "").toLowerCase();
+  return (
+    error.code === "42703" ||
+    error.code === "PGRST204" ||
+    (msg.includes("column") && msg.includes("does not exist")) ||
+    msg.includes("could not find the")
+  );
+}
 
 /**
- * Binds the initialized Supabase client so quota tracking automatically persists to
- * `public.user_daily_quotas`, probing connectivity at startup and logging active storage mode.
+ * Fair fallback estimator when a provider/fallback or aborted stream does not report `usageMetadata`.
+ * Uses 1 token ~= 4 characters (`Math.ceil(chars / 4)`).
+ */
+export function estimateTokenCountFromChars(chars: number): number {
+  if (!Number.isFinite(chars) || chars <= 0) return 0;
+  return Math.ceil(chars / 4);
+}
+
+export function computeUsagePercent(usedTokens: number, dailyLimit: number): number {
+  if (!Number.isFinite(dailyLimit) || dailyLimit <= 0) return 0;
+  if (!Number.isFinite(usedTokens) || usedTokens <= 0) return 0;
+  const raw = (usedTokens / dailyLimit) * 100;
+  return Number(Math.min(100, Math.max(0, raw)).toFixed(1));
+}
+
+/**
+ * Binds the initialized Supabase client so token quota tracking automatically persists to
+ * `public.user_daily_quotas`, probing table & token column availability at startup.
  */
 export function bindQuotaSupabaseClient(client: SupabaseClient | null): void {
   supabaseRef = client;
   supabaseQuotaTableAvailable = null;
+  supabaseTokenColumnsAvailable = null;
 
   if (!client) {
     console.log(
@@ -137,19 +218,25 @@ export function bindQuotaSupabaseClient(client: SupabaseClient | null): void {
     try {
       const { error } = await client
         .from("user_daily_quotas")
-        .select("user_id")
+        .select(
+          "user_id, tokens_used, prompt_tokens_used, completion_tokens_used, daily_token_limit, bonus_tokens"
+        )
         .limit(1);
+
       if (error) {
-        const msg = String(error.message || "").toLowerCase();
-        if (
-          error.code === "42P01" ||
-          error.code === "PGRST205" ||
-          msg.includes("does not exist") ||
-          msg.includes("could not find the table")
-        ) {
+        if (isMissingTableError(error)) {
           supabaseQuotaTableAvailable = false;
+          supabaseTokenColumnsAvailable = false;
           console.warn(
             "[QuotaService] Storage: Local JSON fallback (.data/axioma-quota.json) — tabel public.user_daily_quotas belum dibuat di Supabase"
+          );
+          return;
+        }
+        if (isMissingColumnError(error)) {
+          supabaseQuotaTableAvailable = true;
+          supabaseTokenColumnsAvailable = false;
+          console.warn(
+            "[QuotaService] Storage: Local JSON fallback (.data/axioma-quota.json) — kolom token belum tersedia di public.user_daily_quotas (jalankan migrations/008_token_quota_system.sql)"
           );
           return;
         }
@@ -158,8 +245,10 @@ export function bindQuotaSupabaseClient(client: SupabaseClient | null): void {
         );
         return;
       }
+
       supabaseQuotaTableAvailable = true;
-      console.log("[QuotaService] Storage: Supabase (public.user_daily_quotas)");
+      supabaseTokenColumnsAvailable = true;
+      console.log("[QuotaService] Storage: Supabase token quota (public.user_daily_quotas)");
     } catch (err: any) {
       console.warn(
         `[QuotaService] Storage: Local JSON fallback (.data/axioma-quota.json) — ${err?.message || err}`
@@ -217,73 +306,79 @@ function hydrateLocalStoreOnce(): void {
     if (!fs.existsSync(QUOTA_STORE_PATH)) return;
     const raw = fs.readFileSync(QUOTA_STORE_PATH, "utf-8");
     if (!raw.trim()) return;
-    const parsed = JSON.parse(raw) as Partial<PersistedQuotaFile>;
+    const parsed = JSON.parse(raw) as Partial<PersistedTokenQuotaFile>;
 
     if (parsed.plans && typeof parsed.plans === "object") {
       for (const [uid, plan] of Object.entries(parsed.plans)) {
         if (plan === "free" || plan === "pro") {
-          userPlanMap.set(uid, plan);
+          setBoundedMap(userPlanMap, uid, plan);
         }
       }
     }
 
     if (parsed.proExpiresAt && typeof parsed.proExpiresAt === "object") {
-      for (const [uid, iso] of Object.entries(parsed.proExpiresAt)) {
-        if (typeof iso === "string" && iso.trim() && Number.isFinite(Date.parse(iso))) {
-          userProExpiresAtMap.set(uid, iso.trim());
+      for (const [uid, exp] of Object.entries(parsed.proExpiresAt)) {
+        if (typeof exp === "string" && exp.trim()) {
+          setBoundedMap(userProExpiresAtMap, uid, exp.trim());
         }
       }
     }
 
-    if (parsed.bonusCredits && typeof parsed.bonusCredits === "object") {
-      for (const [uid, credits] of Object.entries(parsed.bonusCredits)) {
-        if (typeof credits === "number" && Number.isFinite(credits) && credits >= 0) {
-          userBonusCreditsMap.set(uid, Math.floor(credits));
+    if (parsed.bonusTokens && typeof parsed.bonusTokens === "object") {
+      for (const [uid, bonus] of Object.entries(parsed.bonusTokens)) {
+        if (typeof bonus === "number" && Number.isFinite(bonus) && bonus >= 0) {
+          setBoundedMap(userBonusTokensMap, uid, Math.floor(bonus));
         }
       }
     }
 
     const todayWib = getWibDateKey();
-    if (parsed.dailyUsage && typeof parsed.dailyUsage === "object") {
-      for (const [key, rec] of Object.entries(parsed.dailyUsage)) {
-        if (!rec || typeof rec !== "object" || rec.dateWib !== todayWib) {
-          continue;
-        }
-        const rawRec = rec as Partial<DailyUsageRecord>;
-        let hydratedDailyCredits: number | null = null;
+    if (parsed.dailyTokenUsage && typeof parsed.dailyTokenUsage === "object") {
+      for (const [key, rec] of Object.entries(parsed.dailyTokenUsage)) {
         if (
-          typeof rawRec.dailyCredits === "number" &&
-          Number.isFinite(rawRec.dailyCredits) &&
-          rawRec.dailyCredits >= 0
+          rec &&
+          typeof rec.userId === "string" &&
+          typeof rec.dateWib === "string" &&
+          rec.dateWib === todayWib
         ) {
-          hydratedDailyCredits = Math.min(
-            DAILY_FREE_CREDITS,
-            Math.floor(rawRec.dailyCredits)
-          );
-        } else if (
-          typeof rawRec.usedCredits === "number" &&
-          Number.isFinite(rawRec.usedCredits) &&
-          rawRec.usedCredits >= 0
-        ) {
-          hydratedDailyCredits = Math.max(
-            0,
-            DAILY_FREE_CREDITS - Math.floor(rawRec.usedCredits)
-          );
-        }
+          const plan = userPlanMap.get(rec.userId) || "free";
+          const limit =
+            typeof rec.dailyTokenLimit === "number" &&
+            Number.isFinite(rec.dailyTokenLimit) &&
+            rec.dailyTokenLimit > 0
+              ? Math.floor(rec.dailyTokenLimit)
+              : getDailyTokenLimitForPlan(plan);
+          const promptUsed =
+            typeof rec.promptTokensUsed === "number" && Number.isFinite(rec.promptTokensUsed)
+              ? Math.max(0, Math.floor(rec.promptTokensUsed))
+              : 0;
+          const completionUsed =
+            typeof rec.completionTokensUsed === "number" &&
+            Number.isFinite(rec.completionTokensUsed)
+              ? Math.max(0, Math.floor(rec.completionTokensUsed))
+              : 0;
+          const totalUsed =
+            typeof rec.tokensUsed === "number" && Number.isFinite(rec.tokensUsed)
+              ? Math.max(promptUsed + completionUsed, Math.floor(rec.tokensUsed))
+              : promptUsed + completionUsed;
 
-        if (hydratedDailyCredits !== null) {
-          dailyUsageMap.set(key, {
-            userId: String(rawRec.userId || key.split(":")[0] || ""),
-            dateWib: todayWib,
-            dailyCredits: hydratedDailyCredits,
-            usedCredits: Math.max(0, DAILY_FREE_CREDITS - hydratedDailyCredits),
-            updatedAt: String(rawRec.updatedAt || new Date().toISOString()),
+          setBoundedMap(dailyTokenUsageMap, key, {
+            userId: rec.userId,
+            dateWib: rec.dateWib,
+            dailyTokenLimit: limit,
+            tokensUsed: totalUsed,
+            promptTokensUsed: promptUsed,
+            completionTokensUsed: completionUsed,
+            updatedAt: typeof rec.updatedAt === "string" ? rec.updatedAt : new Date().toISOString(),
           });
         }
       }
     }
   } catch (err: any) {
-    console.warn("[quotaService] Local quota store hydration warning (falling back to in-memory):", err?.message || err);
+    console.warn(
+      "[quotaService] Local quota store hydration warning (falling back to in-memory):",
+      err?.message || err
+    );
   }
 }
 
@@ -292,48 +387,42 @@ async function flushLocalStoreAsync(): Promise<void> {
     localPersistQueuedAgain = true;
     return;
   }
-  // Skip local JSON persistence completely when Supabase DB is active
-  if (supabaseRef && supabaseQuotaTableAvailable === true) {
-    return;
-  }
-
   localPersistInFlight = true;
   try {
-    cleanupQuotaMaps();
+    const todayWib = getWibDateKey(new Date());
+    const prunedDailyUsage: Record<string, DailyTokenUsageRecord> = {};
+    for (const [key, rec] of dailyTokenUsageMap.entries()) {
+      if (rec.dateWib === todayWib) {
+        prunedDailyUsage[key] = rec;
+      }
+    }
 
-    await fs.promises.mkdir(DATA_DIR, { recursive: true });
-
-    const payload: PersistedQuotaFile = {
+    const payload: PersistedTokenQuotaFile = {
+      version: 2,
       plans: Object.fromEntries(userPlanMap.entries()),
       proExpiresAt: Object.fromEntries(userProExpiresAtMap.entries()),
-      bonusCredits: Object.fromEntries(userBonusCreditsMap.entries()),
-      dailyUsage: Object.fromEntries(dailyUsageMap.entries()),
+      bonusTokens: Object.fromEntries(userBonusTokensMap.entries()),
+      dailyTokenUsage: prunedDailyUsage,
     };
 
-    const tmpPath = `${QUOTA_STORE_PATH}.tmp`;
-    await fs.promises.writeFile(tmpPath, JSON.stringify(payload), "utf-8");
-    await fs.promises.rename(tmpPath, QUOTA_STORE_PATH);
+    await fs.promises.mkdir(DATA_DIR, { recursive: true });
+    await fs.promises.writeFile(QUOTA_STORE_PATH, JSON.stringify(payload, null, 2), "utf-8");
   } catch (err: any) {
-    // Never break request flow if filesystem is read-only (e.g., serverless/container); in-memory Map remains active
-    console.warn("[quotaService] Local quota persist skipped (in-memory active):", err?.message || err);
+    console.warn(
+      "[quotaService] Local quota persist skipped (in-memory active):",
+      err?.message || err
+    );
   } finally {
     localPersistInFlight = false;
     if (localPersistQueuedAgain) {
       localPersistQueuedAgain = false;
-      void flushLocalStoreAsync();
+      persistLocalStoreSafe();
     }
   }
 }
 
-function persistLocalStoreSafe(_now: Date = new Date()): void {
-  // When Supabase DB is active, quota state is persisted in `public.user_daily_quotas` — skip local disk writes
-  if (supabaseRef && supabaseQuotaTableAvailable === true) {
-    return;
-  }
-  // Debounced non-blocking async write for local JSON fallback mode
-  if (pendingLocalPersistTimer !== null) {
-    return;
-  }
+function persistLocalStoreSafe(): void {
+  if (pendingLocalPersistTimer) return;
   pendingLocalPersistTimer = setTimeout(() => {
     pendingLocalPersistTimer = null;
     void flushLocalStoreAsync();
@@ -349,56 +438,74 @@ async function readSupabaseQuotaRow(
 ): Promise<{
   hasTodayRow: boolean;
   plan?: QuotaPlanId;
-  dailyCredits?: number;
-  usedCredits?: number;
-  bonusCredits?: number;
+  dailyTokenLimit?: number;
+  tokensUsed?: number;
+  promptTokensUsed?: number;
+  completionTokensUsed?: number;
+  bonusTokens?: number;
   proExpiresAt?: string | null;
   updatedAt?: string;
 } | null> {
-  if (!supabaseRef || supabaseQuotaTableAvailable === false) {
+  if (
+    !supabaseRef ||
+    supabaseQuotaTableAvailable === false ||
+    supabaseTokenColumnsAvailable === false
+  ) {
     return null;
   }
 
   try {
     const { data, error } = await supabaseRef
       .from("user_daily_quotas")
-      .select("plan, daily_credits, used_credits, bonus_credits, pro_expires_at, updated_at")
+      .select(
+        "plan, daily_token_limit, tokens_used, prompt_tokens_used, completion_tokens_used, bonus_tokens, pro_expires_at, updated_at"
+      )
       .eq("user_id", userId)
       .eq("usage_date", dateWib)
       .maybeSingle();
 
     if (error) {
-      const msg = String(error.message || "").toLowerCase();
-      if (
-        error.code === "42P01" ||
-        error.code === "PGRST205" ||
-        msg.includes("does not exist") ||
-        msg.includes("could not find the table")
-      ) {
+      if (isMissingTableError(error)) {
         supabaseQuotaTableAvailable = false;
+        supabaseTokenColumnsAvailable = false;
+      } else if (isMissingColumnError(error)) {
+        supabaseTokenColumnsAvailable = false;
       }
       return null;
     }
 
     supabaseQuotaTableAvailable = true;
+    supabaseTokenColumnsAvailable = true;
+
     if (data) {
-      const usedVal =
-        typeof data.used_credits === "number"
-          ? Math.max(0, Math.floor(data.used_credits))
+      const plan: QuotaPlanId = data.plan === "pro" ? "pro" : "free";
+      const limitVal =
+        typeof data.daily_token_limit === "number" && data.daily_token_limit > 0
+          ? Math.floor(data.daily_token_limit)
+          : getDailyTokenLimitForPlan(plan);
+      const promptVal =
+        typeof data.prompt_tokens_used === "number"
+          ? Math.max(0, Math.floor(data.prompt_tokens_used))
           : 0;
-      const dailyVal =
-        typeof data.daily_credits === "number"
-          ? Math.min(DAILY_FREE_CREDITS, Math.max(0, Math.floor(data.daily_credits)))
-          : Math.max(0, DAILY_FREE_CREDITS - usedVal);
+      const completionVal =
+        typeof data.completion_tokens_used === "number"
+          ? Math.max(0, Math.floor(data.completion_tokens_used))
+          : 0;
+      const usedVal =
+        typeof data.tokens_used === "number"
+          ? Math.max(promptVal + completionVal, Math.floor(data.tokens_used))
+          : promptVal + completionVal;
 
       return {
         hasTodayRow: true,
-        plan: data.plan === "pro" ? "pro" : "free",
-        dailyCredits: dailyVal,
-        usedCredits: usedVal,
-        bonusCredits:
-          typeof data.bonus_credits === "number"
-            ? Math.max(0, Math.floor(data.bonus_credits))
+        plan,
+        dailyTokenLimit: limitVal,
+        tokensUsed: usedVal,
+        promptTokensUsed: promptVal,
+        completionTokensUsed: completionVal,
+        bonusTokens:
+          typeof data.bonus_tokens === "number"
+            ? Math.max(0, Math.floor(data.bonus_tokens))
             : 0,
         proExpiresAt:
           typeof data.pro_expires_at === "string" && data.pro_expires_at.trim()
@@ -408,11 +515,11 @@ async function readSupabaseQuotaRow(
       };
     }
 
-    // No row yet for today's WIB date: carry forward permanent `plan`, `bonus_credits`, and `pro_expires_at`
-    // from the user's most recent previous row while resetting daily allowance to 30 (`usedCredits = 0`).
+    // No row yet for today's WIB date: carry forward permanent `plan`, `bonus_tokens`, and `pro_expires_at`
+    // while resetting daily token usage to 0.
     const { data: latestPrev, error: prevError } = await supabaseRef
       .from("user_daily_quotas")
-      .select("plan, bonus_credits, pro_expires_at, updated_at")
+      .select("plan, bonus_tokens, pro_expires_at, updated_at")
       .eq("user_id", userId)
       .order("usage_date", { ascending: false })
       .limit(1)
@@ -420,14 +527,17 @@ async function readSupabaseQuotaRow(
 
     if (prevError || !latestPrev) return null;
 
+    const prevPlan: QuotaPlanId = latestPrev.plan === "pro" ? "pro" : "free";
     return {
       hasTodayRow: false,
-      plan: latestPrev.plan === "pro" ? "pro" : "free",
-      dailyCredits: DAILY_FREE_CREDITS,
-      usedCredits: 0,
-      bonusCredits:
-        typeof latestPrev.bonus_credits === "number"
-          ? Math.max(0, Math.floor(latestPrev.bonus_credits))
+      plan: prevPlan,
+      dailyTokenLimit: getDailyTokenLimitForPlan(prevPlan),
+      tokensUsed: 0,
+      promptTokensUsed: 0,
+      completionTokensUsed: 0,
+      bonusTokens:
+        typeof latestPrev.bonus_tokens === "number"
+          ? Math.max(0, Math.floor(latestPrev.bonus_tokens))
           : 0,
       proExpiresAt:
         typeof latestPrev.pro_expires_at === "string" && latestPrev.pro_expires_at.trim()
@@ -441,80 +551,92 @@ async function readSupabaseQuotaRow(
   }
 }
 
-async function upsertSupabaseQuotaRow(
-  userId: string,
-  dateWib: string,
-  plan: QuotaPlanId,
-  dailyCredits: number,
-  usedCredits: number,
-  bonusCredits: number,
-  proExpiresAt?: string | null
-): Promise<void> {
-  if (!supabaseRef || supabaseQuotaTableAvailable === false) {
+async function upsertSupabaseQuotaRow(params: {
+  userId: string;
+  dateWib: string;
+  plan: QuotaPlanId;
+  dailyTokenLimit: number;
+  tokensUsed: number;
+  promptTokensUsed: number;
+  completionTokensUsed: number;
+  bonusTokens: number;
+  proExpiresAt?: string | null;
+}): Promise<void> {
+  if (
+    !supabaseRef ||
+    supabaseQuotaTableAvailable === false ||
+    supabaseTokenColumnsAvailable === false
+  ) {
     return;
   }
+
   try {
     const { error } = await supabaseRef.from("user_daily_quotas").upsert(
       {
-        user_id: userId,
-        usage_date: dateWib,
-        plan,
-        daily_credits: Math.min(DAILY_FREE_CREDITS, Math.max(0, Math.floor(dailyCredits))),
-        used_credits: Math.max(0, Math.floor(usedCredits)),
-        bonus_credits: Math.max(0, Math.floor(bonusCredits)),
-        pro_expires_at: proExpiresAt || null,
+        user_id: params.userId,
+        usage_date: params.dateWib,
+        plan: params.plan,
+        daily_token_limit: Math.max(0, Math.floor(params.dailyTokenLimit)),
+        tokens_used: Math.max(0, Math.floor(params.tokensUsed)),
+        prompt_tokens_used: Math.max(0, Math.floor(params.promptTokensUsed)),
+        completion_tokens_used: Math.max(0, Math.floor(params.completionTokensUsed)),
+        bonus_tokens: Math.max(0, Math.floor(params.bonusTokens)),
+        pro_expires_at: params.proExpiresAt || null,
         updated_at: new Date().toISOString(),
       },
       { onConflict: "user_id,usage_date" }
     );
+
     if (error) {
-      const msg = String(error.message || "").toLowerCase();
-      if (
-        error.code === "42P01" ||
-        error.code === "PGRST205" ||
-        msg.includes("does not exist") ||
-        msg.includes("could not find the table")
-      ) {
+      if (isMissingTableError(error)) {
         supabaseQuotaTableAvailable = false;
+        supabaseTokenColumnsAvailable = false;
+      } else if (isMissingColumnError(error)) {
+        supabaseTokenColumnsAvailable = false;
       }
     }
   } catch {
-    // Best-effort DB sync; local persistent store + Map remain authoritative
+    // Best-effort DB sync; local persistent store + in-memory Map remain authoritative
   }
+}
+
+export interface PreflightUserQuotaState {
+  userId: string;
+  plan: QuotaPlanId;
+  dailyLimit: number;
+  tokensUsed: number;
+  promptTokensUsed: number;
+  completionTokensUsed: number;
+  bonusTokens: number;
+  dateWib: string;
+  expiresAt?: string;
 }
 
 async function loadUserDailyState(
   userId: string,
   now: Date = new Date()
-): Promise<{
-  plan: QuotaPlanId;
-  dailyCredits: number;
-  usedToday: number;
-  bonusCredits: number;
-  dateWib: string;
-  expiresAt?: string;
-}> {
+): Promise<PreflightUserQuotaState> {
   hydrateLocalStoreOnce();
 
   const cleanUserId = (userId || "").trim() || "anonymous";
   const dateWib = getWibDateKey(now);
   const usageKey = makeUsageKey(cleanUserId, dateWib);
 
-  // Check optional DB row if table is available (preserving permanent bonusCredits across WIB day rollover)
   const dbRow = await readSupabaseQuotaRow(cleanUserId, dateWib);
   if (dbRow) {
-    const existingLocal = dailyUsageMap.get(usageKey);
+    const existingLocal = dailyTokenUsageMap.get(usageKey);
     const localUpdatedMs = existingLocal ? Date.parse(existingLocal.updatedAt) || 0 : 0;
     const dbUpdatedMs = dbRow.updatedAt ? Date.parse(dbRow.updatedAt) || 0 : 0;
 
     if (dbRow.plan && (!userPlanMap.has(cleanUserId) || dbUpdatedMs > localUpdatedMs)) {
       setBoundedMap(userPlanMap, cleanUserId, dbRow.plan);
     }
+
     if (
-      typeof dbRow.bonusCredits === "number" &&
-      (!userBonusCreditsMap.has(cleanUserId) || dbUpdatedMs > localUpdatedMs)
+      typeof dbRow.bonusTokens === "number" &&
+      (!userBonusTokensMap.has(cleanUserId) || dbUpdatedMs > localUpdatedMs)
     ) {
-      setBoundedMap(userBonusCreditsMap, cleanUserId, Math.max(0, dbRow.bonusCredits));
+      setBoundedMap(userBonusTokensMap, cleanUserId, Math.max(0, dbRow.bonusTokens));
     }
 
     if (
@@ -530,16 +652,15 @@ async function loadUserDailyState(
     }
 
     if (dbRow.hasTodayRow && (!existingLocal || dbUpdatedMs > localUpdatedMs)) {
-      const dbDaily =
-        typeof dbRow.dailyCredits === "number"
-          ? Math.min(DAILY_FREE_CREDITS, Math.max(0, dbRow.dailyCredits))
-          : Math.max(0, DAILY_FREE_CREDITS - Math.max(0, dbRow.usedCredits ?? 0));
-      const dbUsed = Math.max(0, DAILY_FREE_CREDITS - dbDaily);
-      setBoundedMap(dailyUsageMap, usageKey, {
+      const resolvedPlan = dbRow.plan || userPlanMap.get(cleanUserId) || "free";
+      const resolvedLimit = getDailyTokenLimitForPlan(resolvedPlan);
+      setBoundedMap(dailyTokenUsageMap, usageKey, {
         userId: cleanUserId,
         dateWib,
-        dailyCredits: dbDaily,
-        usedCredits: dbUsed,
+        dailyTokenLimit: resolvedLimit,
+        tokensUsed: Math.max(0, dbRow.tokensUsed ?? 0),
+        promptTokensUsed: Math.max(0, dbRow.promptTokensUsed ?? 0),
+        completionTokensUsed: Math.max(0, dbRow.completionTokensUsed ?? 0),
         updatedAt: dbRow.updatedAt || now.toISOString(),
       });
     }
@@ -558,188 +679,314 @@ async function loadUserDailyState(
       expiresAt = undefined;
       userPlanMap.set(cleanUserId, "free");
       userProExpiresAtMap.delete(cleanUserId);
-      persistLocalStoreSafe(now);
+      persistLocalStoreSafe();
     }
   }
 
-  const existingDailyRecord = dailyUsageMap.get(usageKey);
-  const dailyCredits = existingDailyRecord
-    ? Math.max(0, Math.min(DAILY_FREE_CREDITS, existingDailyRecord.dailyCredits))
-    : DAILY_FREE_CREDITS;
-  const usedToday = Math.max(0, DAILY_FREE_CREDITS - dailyCredits);
-  const bonusCredits = Math.max(0, userBonusCreditsMap.get(cleanUserId) ?? 0);
+  const dailyLimit = getDailyTokenLimitForPlan(plan);
+  const existingDailyRecord = dailyTokenUsageMap.get(usageKey);
+  const tokensUsed = existingDailyRecord ? Math.max(0, existingDailyRecord.tokensUsed) : 0;
+  const promptTokensUsed = existingDailyRecord
+    ? Math.max(0, existingDailyRecord.promptTokensUsed)
+    : 0;
+  const completionTokensUsed = existingDailyRecord
+    ? Math.max(0, existingDailyRecord.completionTokensUsed)
+    : 0;
+  const bonusTokens = Math.max(0, userBonusTokensMap.get(cleanUserId) ?? 0);
 
-  return { plan, dailyCredits, usedToday, bonusCredits, dateWib, expiresAt };
+  return {
+    userId: cleanUserId,
+    plan,
+    dailyLimit,
+    tokensUsed,
+    promptTokensUsed,
+    completionTokensUsed,
+    bonusTokens,
+    dateWib,
+    expiresAt,
+  };
+}
+
+function buildTokenSummary(params: {
+  plan: QuotaPlanId;
+  dailyLimit: number;
+  tokensUsed: number;
+  promptTokensUsed: number;
+  completionTokensUsed: number;
+  bonusTokens: number;
+  resetAt: string;
+  lastRequestTokens?: TokenUsageSummary["lastRequestTokens"];
+}): TokenUsageSummary {
+  const dailyRemaining = Math.max(0, params.dailyLimit - params.tokensUsed);
+  const remainingTokens = dailyRemaining + Math.max(0, params.bonusTokens);
+  const usagePercent = computeUsagePercent(params.tokensUsed, params.dailyLimit);
+
+  return {
+    plan: params.plan,
+    unit: "token",
+    dailyLimit: params.dailyLimit,
+    usedTokens: params.tokensUsed,
+    remainingTokens,
+    bonusTokens: Math.max(0, params.bonusTokens),
+    usagePercent,
+    promptTokensUsed: Math.max(0, params.promptTokensUsed),
+    completionTokensUsed: Math.max(0, params.completionTokensUsed),
+    resetAt: params.resetAt,
+    ...(params.lastRequestTokens ? { lastRequestTokens: params.lastRequestTokens } : {}),
+  };
 }
 
 /**
- * Returns the active quota status for `userId` with separate daily free credits (auto-reset 00:00 WIB)
- * and permanent top-up/admin `bonusCredits` (never reset on date rollover).
+ * Returns the active daily token quota snapshot for `userId` (`GET /api/quota`).
  */
 export async function getUserQuota(
   userId: string,
   now: Date = new Date()
 ): Promise<UserQuotaSnapshot> {
-  const { plan, dailyCredits, usedToday, bonusCredits, expiresAt } =
-    await loadUserDailyState(userId, now);
+  const state = await loadUserDailyState(userId, now);
   const resetAt = getNextWibMidnightIso(now);
-  const unlimited = plan === "pro";
-  const effectiveDailyCredits = unlimited ? DAILY_FREE_CREDITS : dailyCredits;
-  const remainingCredits = unlimited
-    ? UNLIMITED_CREDITS_DISPLAY
-    : effectiveDailyCredits + bonusCredits;
+  const summary = buildTokenSummary({
+    plan: state.plan,
+    dailyLimit: state.dailyLimit,
+    tokensUsed: state.tokensUsed,
+    promptTokensUsed: state.promptTokensUsed,
+    completionTokensUsed: state.completionTokensUsed,
+    bonusTokens: state.bonusTokens,
+    resetAt,
+  });
 
   return {
-    plan,
-    unlimited,
-    remainingCredits,
-    dailyCredits: effectiveDailyCredits,
-    bonusCredits,
-    dailyLimit: DAILY_FREE_CREDITS,
-    usedToday,
-    resetAt,
-    ...(unlimited && expiresAt ? { expiresAt } : {}),
-    costs: MODEL_CREDIT_COST,
+    ...summary,
+    ...(state.plan === "pro" && state.expiresAt ? { expiresAt: state.expiresAt } : {}),
+    minTokensToStart: MIN_TOKENS_TO_START,
+    mediaTokenCost: MEDIA_TOKEN_COST,
+    weights: MODEL_TOKEN_MULTIPLIER,
     tiers: PLAN_TIERS,
+    topupPacks: TOPUP_TOKEN_PACKS,
   };
 }
 
-export interface PreflightUserQuotaState {
-  userId: string;
-  plan: QuotaPlanId;
-  dailyCredits: number;
-  usedToday: number;
-  bonusCredits: number;
-  dateWib: string;
-  expiresAt?: string;
-}
-
 /**
- * Loads user's daily quota state without consuming credits yet.
- * Useful to run in parallel with Turnstile & chat/history lookup before committing deduction.
+ * Loads user's daily token quota state without deducting tokens yet.
+ * Run in parallel with Turnstile & chat/history lookup before streaming starts.
  */
 export async function prefetchUserQuotaState(
   userId: string,
   now: Date = new Date()
 ): Promise<PreflightUserQuotaState> {
-  const cleanUserId = (userId || "").trim() || "anonymous";
-  const loaded = await loadUserDailyState(cleanUserId, now);
-  return {
-    userId: cleanUserId,
-    ...loaded,
-  };
+  return loadUserDailyState(userId, now);
 }
 
 /**
- * Synchronously validates and deducts credits using a prefetched quota state (0ms DB latency).
- * Persists asynchronously to Supabase (`upsertSupabaseQuotaRow`) and debounced local fallback if needed.
+ * Synchronously validates whether the user has enough remaining tokens to start a request
+ * (`MIN_TOKENS_TO_START` for text chat, or `MEDIA_TOKEN_COST` for image/video generation).
+ * Does NOT deduct tokens yet — real token deduction occurs in `recordTokenUsage` after generation.
  */
-export function consumeQuotaFromPreflight(
+export function checkTokenQuotaPreFlight(
   preflight: PreflightUserQuotaState,
-  modelKey: QuotaModelKey,
+  options?: {
+    modelKey?: QuotaModelKey;
+    requiredTokens?: number;
+  },
   now: Date = new Date()
-): QuotaCheckResult {
+): TokenPreFlightResult {
   const cleanUserId = preflight.userId;
-  const cost = MODEL_CREDIT_COST[modelKey] ?? MODEL_CREDIT_COST.pro;
   const resetAt = getNextWibMidnightIso(now);
-  const { plan, dateWib } = preflight;
+  const requiredTokens = Math.max(
+    1,
+    Math.floor(
+      options?.requiredTokens ??
+        (options?.modelKey === "media" ? MEDIA_TOKEN_COST : MIN_TOKENS_TO_START)
+    )
+  );
 
-  // Guard against concurrent requests updating in-memory balances while preflight was in flight
-  const usageKey = makeUsageKey(cleanUserId, dateWib);
-  const latestDailyRecord = dailyUsageMap.get(usageKey);
-  const dailyCredits = latestDailyRecord
-    ? Math.min(preflight.dailyCredits, Math.max(0, Math.min(DAILY_FREE_CREDITS, latestDailyRecord.dailyCredits)))
-    : preflight.dailyCredits;
-  const latestBonus = userBonusCreditsMap.get(cleanUserId);
-  const bonusCredits =
+  // Merge with latest in-memory counters to protect against concurrent requests
+  const usageKey = makeUsageKey(cleanUserId, preflight.dateWib);
+  const latestDaily = dailyTokenUsageMap.get(usageKey);
+  const latestBonus = userBonusTokensMap.get(cleanUserId);
+
+  const tokensUsed = latestDaily
+    ? Math.max(preflight.tokensUsed, latestDaily.tokensUsed)
+    : preflight.tokensUsed;
+  const promptTokensUsed = latestDaily
+    ? Math.max(preflight.promptTokensUsed, latestDaily.promptTokensUsed)
+    : preflight.promptTokensUsed;
+  const completionTokensUsed = latestDaily
+    ? Math.max(preflight.completionTokensUsed, latestDaily.completionTokensUsed)
+    : preflight.completionTokensUsed;
+  const bonusTokens =
     typeof latestBonus === "number"
-      ? Math.min(preflight.bonusCredits, Math.max(0, latestBonus))
-      : preflight.bonusCredits;
+      ? Math.min(preflight.bonusTokens, Math.max(0, latestBonus))
+      : preflight.bonusTokens;
 
-  if (plan === "pro") {
-    return {
-      allowed: true,
-      plan: "pro",
-      remaining: UNLIMITED_CREDITS_DISPLAY,
-      dailyCredits: DAILY_FREE_CREDITS,
-      bonusCredits,
-      required: cost,
-      resetAt,
-    };
-  }
+  const dailyLimit = preflight.dailyLimit;
+  const dailyRemaining = Math.max(0, dailyLimit - tokensUsed);
+  const remainingTokens = dailyRemaining + bonusTokens;
+  const usagePercent = computeUsagePercent(tokensUsed, dailyLimit);
 
-  const totalAvailable = dailyCredits + bonusCredits;
-
-  if (totalAvailable < cost) {
+  if (remainingTokens <= 0 || remainingTokens < requiredTokens) {
     return {
       allowed: false,
       code: "QUOTA_EXCEEDED",
-      plan,
-      required: cost,
-      remaining: totalAvailable,
-      dailyCredits,
-      bonusCredits,
+      plan: preflight.plan,
+      unit: "token",
+      dailyLimit,
+      usedTokens: tokensUsed,
+      remainingTokens,
+      bonusTokens,
+      usagePercent,
+      promptTokensUsed,
+      completionTokensUsed,
+      requiredTokens,
       resetAt,
-      suggestedModel: "omni",
     };
   }
 
-  // Consume from daily free allowance (`dailyCredits`) first, then permanent `bonusCredits`
-  const consumeFromDaily = Math.min(dailyCredits, cost);
-  const consumeFromBonus = cost - consumeFromDaily;
-  const nextDailyCredits = Math.max(0, dailyCredits - consumeFromDaily);
-  const nextUsedToday = Math.max(0, DAILY_FREE_CREDITS - nextDailyCredits);
-  const nextBonusCredits = Math.max(0, bonusCredits - consumeFromBonus);
-  const nextRemaining = nextDailyCredits + nextBonusCredits;
-
-  setBoundedMap(dailyUsageMap, usageKey, {
-    userId: cleanUserId,
-    dateWib,
-    dailyCredits: nextDailyCredits,
-    usedCredits: nextUsedToday,
-    updatedAt: now.toISOString(),
-  });
-  setBoundedMap(userBonusCreditsMap, cleanUserId, nextBonusCredits);
-
-  persistLocalStoreSafe(now);
-  void upsertSupabaseQuotaRow(
-    cleanUserId,
-    dateWib,
-    plan,
-    nextDailyCredits,
-    nextUsedToday,
-    nextBonusCredits,
-    userProExpiresAtMap.get(cleanUserId) || null
-  );
-
   return {
     allowed: true,
-    plan,
-    remaining: nextRemaining,
-    dailyCredits: nextDailyCredits,
-    bonusCredits: nextBonusCredits,
-    required: cost,
+    plan: preflight.plan,
+    unit: "token",
+    dailyLimit,
+    usedTokens: tokensUsed,
+    remainingTokens,
+    bonusTokens,
+    usagePercent,
+    promptTokensUsed,
+    completionTokensUsed,
+    requiredTokens,
     resetAt,
   };
 }
 
+export interface RecordTokenUsageInput {
+  modelKey: QuotaModelKey;
+  promptTokens: number;
+  completionTokens: number;
+  /** Optional fixed total tokens (used for media generation = MEDIA_TOKEN_COST). */
+  fixedTotalTokens?: number;
+  source: TokenMeasurementSource;
+  preflight?: PreflightUserQuotaState | null;
+}
+
 /**
- * Checks whether `userId` has enough credits for `modelKey` and deducts atomically when allowed.
- * - `plan === "pro"` is always permitted without deducting `dailyCredits` or `bonusCredits`.
- * - Free users consume `dailyCredits` first, then take any remainder from permanent `bonusCredits`.
- * - Rejects with `QUOTA_EXCEEDED` when `dailyCredits + bonusCredits < cost`.
+ * Records actual measured (or fallback-estimated) token consumption after generation completes.
+ * - Applies `MODEL_TOKEN_MULTIPLIER[modelKey]` cleanly to prompt & completion tokens.
+ * - Deducts from daily allowance first, spilling any overflow into permanent `bonusTokens`.
+ * - Persists asynchronously to Supabase `public.user_daily_quotas` and debounced local JSON fallback.
  */
-export async function checkAndConsumeQuota(
+export function recordTokenUsage(
   userId: string,
-  modelKey: QuotaModelKey,
+  input: RecordTokenUsageInput,
   now: Date = new Date()
-): Promise<QuotaCheckResult> {
-  const preflight = await prefetchUserQuotaState(userId, now);
-  return consumeQuotaFromPreflight(preflight, modelKey, now);
+): TokenUsageSummary {
+  hydrateLocalStoreOnce();
+
+  const cleanUserId = (userId || "").trim() || "anonymous";
+  const dateWib = input.preflight?.dateWib || getWibDateKey(now);
+  const usageKey = makeUsageKey(cleanUserId, dateWib);
+  const resetAt = getNextWibMidnightIso(now);
+
+  const proIds = getEnvProUserIds();
+  const plan: QuotaPlanId =
+    input.preflight?.plan ||
+    (proIds.has(cleanUserId) ? "pro" : userPlanMap.get(cleanUserId) || "free");
+  const dailyLimit = input.preflight?.dailyLimit || getDailyTokenLimitForPlan(plan);
+
+  const latestDaily = dailyTokenUsageMap.get(usageKey);
+  const prevTokensUsed = latestDaily
+    ? Math.max(latestDaily.tokensUsed, input.preflight?.tokensUsed ?? 0)
+    : input.preflight?.tokensUsed ?? 0;
+  const prevPromptUsed = latestDaily
+    ? Math.max(latestDaily.promptTokensUsed, input.preflight?.promptTokensUsed ?? 0)
+    : input.preflight?.promptTokensUsed ?? 0;
+  const prevCompletionUsed = latestDaily
+    ? Math.max(latestDaily.completionTokensUsed, input.preflight?.completionTokensUsed ?? 0)
+    : input.preflight?.completionTokensUsed ?? 0;
+
+  const latestBonus = userBonusTokensMap.get(cleanUserId);
+  const prevBonusTokens =
+    typeof latestBonus === "number"
+      ? Math.max(0, latestBonus)
+      : Math.max(0, input.preflight?.bonusTokens ?? 0);
+
+  const multiplier = MODEL_TOKEN_MULTIPLIER[input.modelKey] ?? 1.0;
+
+  let billedPrompt: number;
+  let billedCompletion: number;
+  let billedTotal: number;
+
+  if (
+    typeof input.fixedTotalTokens === "number" &&
+    Number.isFinite(input.fixedTotalTokens) &&
+    input.fixedTotalTokens > 0
+  ) {
+    billedTotal = Math.round(input.fixedTotalTokens);
+    const rawPrompt = Math.max(0, Math.round(input.promptTokens));
+    billedPrompt = Math.min(billedTotal, rawPrompt);
+    billedCompletion = Math.max(0, billedTotal - billedPrompt);
+  } else {
+    const safePrompt = Math.max(0, Math.round(input.promptTokens));
+    const safeCompletion = Math.max(0, Math.round(input.completionTokens));
+    billedPrompt = Math.max(0, Math.round(safePrompt * multiplier));
+    billedCompletion = Math.max(0, Math.round(safeCompletion * multiplier));
+    billedTotal = billedPrompt + billedCompletion;
+  }
+
+  // Deduct from remaining daily allowance first; spill overflow into permanent bonusTokens
+  const dailyRemainingBefore = Math.max(0, dailyLimit - prevTokensUsed);
+  const deductedFromDaily = Math.min(dailyRemainingBefore, billedTotal);
+  const overflowToBonus = Math.max(0, billedTotal - deductedFromDaily);
+  const deductedFromBonus = Math.min(prevBonusTokens, overflowToBonus);
+
+  const nextTokensUsed = prevTokensUsed + billedTotal;
+  const nextPromptUsed = prevPromptUsed + billedPrompt;
+  const nextCompletionUsed = prevCompletionUsed + billedCompletion;
+  const nextBonusTokens = Math.max(0, prevBonusTokens - deductedFromBonus);
+
+  setBoundedMap(dailyTokenUsageMap, usageKey, {
+    userId: cleanUserId,
+    dateWib,
+    dailyTokenLimit: dailyLimit,
+    tokensUsed: nextTokensUsed,
+    promptTokensUsed: nextPromptUsed,
+    completionTokensUsed: nextCompletionUsed,
+    updatedAt: now.toISOString(),
+  });
+  setBoundedMap(userBonusTokensMap, cleanUserId, nextBonusTokens);
+
+  persistLocalStoreSafe();
+  void upsertSupabaseQuotaRow({
+    userId: cleanUserId,
+    dateWib,
+    plan,
+    dailyTokenLimit: dailyLimit,
+    tokensUsed: nextTokensUsed,
+    promptTokensUsed: nextPromptUsed,
+    completionTokensUsed: nextCompletionUsed,
+    bonusTokens: nextBonusTokens,
+    proExpiresAt: userProExpiresAtMap.get(cleanUserId) || null,
+  });
+
+  return buildTokenSummary({
+    plan,
+    dailyLimit,
+    tokensUsed: nextTokensUsed,
+    promptTokensUsed: nextPromptUsed,
+    completionTokensUsed: nextCompletionUsed,
+    bonusTokens: nextBonusTokens,
+    resetAt,
+    lastRequestTokens: {
+      promptTokens: billedPrompt,
+      completionTokens: billedCompletion,
+      totalTokens: billedTotal,
+      multiplier,
+      source: input.source,
+    },
+  });
 }
 
 export interface AdminQuotaUpdateInput {
-  addCredits?: number;
+  addTokens?: number;
   resetDaily?: boolean;
   plan?: QuotaPlanId;
   proDurationDays?: number;
@@ -747,9 +994,9 @@ export interface AdminQuotaUpdateInput {
 
 /**
  * Admin operation:
- * - `addCredits`: adds directly to permanent `bonusCredits` (never modifies `dailyCredits`).
- * - `resetDaily`: resets only `dailyCredits` back to `DAILY_FREE_CREDITS` (30) without touching `bonusCredits`.
- * - `plan`: updates subscription tier (`free` | `pro`), with optional `proDurationDays` (e.g. 30 days).
+ * - `addTokens`: adds directly to permanent `bonusTokens` (never auto-reset at 00:00 WIB).
+ * - `resetDaily`: resets today's `tokensUsed`, `promptTokensUsed`, and `completionTokensUsed` back to 0.
+ * - `plan`: updates subscription tier (`free` | `pro`), with optional `proDurationDays`.
  */
 export async function adminUpdateUserQuota(
   userId: string,
@@ -757,21 +1004,21 @@ export async function adminUpdateUserQuota(
   now: Date = new Date()
 ): Promise<UserQuotaSnapshot> {
   const cleanUserId = (userId || "").trim();
-  const { plan: currentPlan, dailyCredits, bonusCredits, dateWib, expiresAt: currentExpiresAt } =
-    await loadUserDailyState(cleanUserId, now);
+  const current = await loadUserDailyState(cleanUserId, now);
 
   const nextPlan: QuotaPlanId =
-    patch.plan === "free" || patch.plan === "pro" ? patch.plan : currentPlan;
-  const nextDailyCredits =
-    patch.resetDaily === true ? DAILY_FREE_CREDITS : dailyCredits;
-  const nextUsedToday = Math.max(0, DAILY_FREE_CREDITS - nextDailyCredits);
-  const deltaCredits =
-    typeof patch.addCredits === "number" && Number.isFinite(patch.addCredits)
-      ? Math.trunc(patch.addCredits)
+    patch.plan === "free" || patch.plan === "pro" ? patch.plan : current.plan;
+  const nextDailyLimit = getDailyTokenLimitForPlan(nextPlan);
+  const nextTokensUsed = patch.resetDaily === true ? 0 : current.tokensUsed;
+  const nextPromptUsed = patch.resetDaily === true ? 0 : current.promptTokensUsed;
+  const nextCompletionUsed = patch.resetDaily === true ? 0 : current.completionTokensUsed;
+  const deltaTokens =
+    typeof patch.addTokens === "number" && Number.isFinite(patch.addTokens)
+      ? Math.trunc(patch.addTokens)
       : 0;
-  const nextBonusCredits = Math.max(0, bonusCredits + deltaCredits);
+  const nextBonusTokens = Math.max(0, current.bonusTokens + deltaTokens);
 
-  userPlanMap.set(cleanUserId, nextPlan);
+  setBoundedMap(userPlanMap, cleanUserId, nextPlan);
 
   if (nextPlan === "free") {
     userProExpiresAtMap.delete(cleanUserId);
@@ -781,43 +1028,44 @@ export async function adminUpdateUserQuota(
     Number.isFinite(patch.proDurationDays) &&
     patch.proDurationDays > 0
   ) {
-    const existingMs = currentExpiresAt ? Date.parse(currentExpiresAt) : NaN;
+    const existingMs = current.expiresAt ? Date.parse(current.expiresAt) : NaN;
     const baseMs =
-      Number.isFinite(existingMs) && existingMs > now.getTime()
-        ? existingMs
-        : now.getTime();
+      Number.isFinite(existingMs) && existingMs > now.getTime() ? existingMs : now.getTime();
     const nextExpiryIso = new Date(
       baseMs + Math.floor(patch.proDurationDays) * 24 * 60 * 60 * 1000
     ).toISOString();
-    userProExpiresAtMap.set(cleanUserId, nextExpiryIso);
+    setBoundedMap(userProExpiresAtMap, cleanUserId, nextExpiryIso);
   }
 
-  userBonusCreditsMap.set(cleanUserId, nextBonusCredits);
-  dailyUsageMap.set(makeUsageKey(cleanUserId, dateWib), {
+  setBoundedMap(userBonusTokensMap, cleanUserId, nextBonusTokens);
+  setBoundedMap(dailyTokenUsageMap, makeUsageKey(cleanUserId, current.dateWib), {
     userId: cleanUserId,
-    dateWib,
-    dailyCredits: nextDailyCredits,
-    usedCredits: nextUsedToday,
+    dateWib: current.dateWib,
+    dailyTokenLimit: nextDailyLimit,
+    tokensUsed: nextTokensUsed,
+    promptTokensUsed: nextPromptUsed,
+    completionTokensUsed: nextCompletionUsed,
     updatedAt: now.toISOString(),
   });
 
-  persistLocalStoreSafe(now);
-  await upsertSupabaseQuotaRow(
-    cleanUserId,
-    dateWib,
-    nextPlan,
-    nextDailyCredits,
-    nextUsedToday,
-    nextBonusCredits,
-    userProExpiresAtMap.get(cleanUserId) || null
-  );
+  persistLocalStoreSafe();
+  await upsertSupabaseQuotaRow({
+    userId: cleanUserId,
+    dateWib: current.dateWib,
+    plan: nextPlan,
+    dailyTokenLimit: nextDailyLimit,
+    tokensUsed: nextTokensUsed,
+    promptTokensUsed: nextPromptUsed,
+    completionTokensUsed: nextCompletionUsed,
+    bonusTokens: nextBonusTokens,
+    proExpiresAt: userProExpiresAtMap.get(cleanUserId) || null,
+  });
 
   return getUserQuota(cleanUserId, now);
 }
 
 /**
  * Activates Axioma Pro subscription for `durationDays` (default 30 days).
- * Extends cleanly from existing future expiration if the user is already Pro.
  */
 export async function activateProSubscription(
   userId: string,
@@ -835,17 +1083,17 @@ export async function activateProSubscription(
 }
 
 /**
- * Adds permanent top-up/bonus credits to `bonusCredits` (never reset at 00:00 WIB).
+ * Adds permanent top-up/bonus tokens to `bonusTokens` (never reset at 00:00 WIB).
  */
-export async function addPermanentBonusCredits(
+export async function addPermanentBonusTokens(
   userId: string,
-  credits: number,
+  tokens: number,
   now: Date = new Date()
 ): Promise<UserQuotaSnapshot> {
   return adminUpdateUserQuota(
     userId,
     {
-      addCredits: Math.max(0, Math.trunc(credits)),
+      addTokens: Math.max(0, Math.trunc(tokens)),
     },
     now
   );
