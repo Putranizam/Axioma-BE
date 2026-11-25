@@ -65,12 +65,54 @@ interface PersistedQuotaFile {
 
 const DATA_DIR = path.resolve(process.cwd(), ".data");
 const QUOTA_STORE_PATH = path.join(DATA_DIR, "axioma-quota.json");
+const MAX_QUOTA_CACHE_ENTRIES = 5_000;
+const QUOTA_CACHE_CLEANUP_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+const LOCAL_PERSIST_DEBOUNCE_MS = 2_000;
 
 // Fast in-memory cache keyed by `${userId}:${YYYY-MM-DD_WIB}`
 const dailyUsageMap = new Map<string, DailyUsageRecord>();
 const userPlanMap = new Map<string, QuotaPlanId>();
 const userProExpiresAtMap = new Map<string, string>();
 const userBonusCreditsMap = new Map<string, number>();
+
+function setBoundedMap<K, V>(map: Map<K, V>, key: K, value: V, maxEntries = MAX_QUOTA_CACHE_ENTRIES): void {
+  if (map.has(key)) {
+    map.delete(key);
+  } else if (map.size >= maxEntries) {
+    const oldestKey = map.keys().next().value;
+    if (oldestKey !== undefined) {
+      map.delete(oldestKey);
+    }
+  }
+  map.set(key, value);
+}
+
+function cleanupQuotaMaps(now: Date = new Date()): void {
+  const todayWib = getWibDateKey(now);
+  for (const [key, rec] of dailyUsageMap.entries()) {
+    if (rec.dateWib !== todayWib) {
+      dailyUsageMap.delete(key);
+    }
+  }
+  for (const map of [dailyUsageMap, userPlanMap, userProExpiresAtMap, userBonusCreditsMap] as Array<Map<string, unknown>>) {
+    while (map.size > MAX_QUOTA_CACHE_ENTRIES) {
+      const oldestKey = map.keys().next().value;
+      if (oldestKey === undefined) break;
+      map.delete(oldestKey);
+    }
+  }
+}
+
+const quotaCleanupTimer = setInterval(() => {
+  cleanupQuotaMaps();
+}, QUOTA_CACHE_CLEANUP_INTERVAL_MS);
+if (typeof quotaCleanupTimer.unref === "function") {
+  quotaCleanupTimer.unref();
+}
+
+let pendingLocalPersistTimer: ReturnType<typeof setTimeout> | null = null;
+let localPersistInFlight = false;
+let localPersistQueuedAgain = false;
 
 let storeHydrated = false;
 let supabaseRef: SupabaseClient | null = null;
@@ -245,19 +287,21 @@ function hydrateLocalStoreOnce(): void {
   }
 }
 
-function persistLocalStoreSafe(now: Date = new Date()): void {
-  try {
-    const todayWib = getWibDateKey(now);
-    // Prune stale daily records only — permanent `userBonusCreditsMap` is NEVER reset on date rollover
-    for (const [key, rec] of dailyUsageMap.entries()) {
-      if (rec.dateWib !== todayWib) {
-        dailyUsageMap.delete(key);
-      }
-    }
+async function flushLocalStoreAsync(): Promise<void> {
+  if (localPersistInFlight) {
+    localPersistQueuedAgain = true;
+    return;
+  }
+  // Skip local JSON persistence completely when Supabase DB is active
+  if (supabaseRef && supabaseQuotaTableAvailable === true) {
+    return;
+  }
 
-    if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-    }
+  localPersistInFlight = true;
+  try {
+    cleanupQuotaMaps();
+
+    await fs.promises.mkdir(DATA_DIR, { recursive: true });
 
     const payload: PersistedQuotaFile = {
       plans: Object.fromEntries(userPlanMap.entries()),
@@ -267,11 +311,35 @@ function persistLocalStoreSafe(now: Date = new Date()): void {
     };
 
     const tmpPath = `${QUOTA_STORE_PATH}.tmp`;
-    fs.writeFileSync(tmpPath, JSON.stringify(payload, null, 2), "utf-8");
-    fs.renameSync(tmpPath, QUOTA_STORE_PATH);
+    await fs.promises.writeFile(tmpPath, JSON.stringify(payload), "utf-8");
+    await fs.promises.rename(tmpPath, QUOTA_STORE_PATH);
   } catch (err: any) {
     // Never break request flow if filesystem is read-only (e.g., serverless/container); in-memory Map remains active
     console.warn("[quotaService] Local quota persist skipped (in-memory active):", err?.message || err);
+  } finally {
+    localPersistInFlight = false;
+    if (localPersistQueuedAgain) {
+      localPersistQueuedAgain = false;
+      void flushLocalStoreAsync();
+    }
+  }
+}
+
+function persistLocalStoreSafe(_now: Date = new Date()): void {
+  // When Supabase DB is active, quota state is persisted in `public.user_daily_quotas` — skip local disk writes
+  if (supabaseRef && supabaseQuotaTableAvailable === true) {
+    return;
+  }
+  // Debounced non-blocking async write for local JSON fallback mode
+  if (pendingLocalPersistTimer !== null) {
+    return;
+  }
+  pendingLocalPersistTimer = setTimeout(() => {
+    pendingLocalPersistTimer = null;
+    void flushLocalStoreAsync();
+  }, LOCAL_PERSIST_DEBOUNCE_MS);
+  if (typeof pendingLocalPersistTimer.unref === "function") {
+    pendingLocalPersistTimer.unref();
   }
 }
 
@@ -440,20 +508,20 @@ async function loadUserDailyState(
     const dbUpdatedMs = dbRow.updatedAt ? Date.parse(dbRow.updatedAt) || 0 : 0;
 
     if (dbRow.plan && (!userPlanMap.has(cleanUserId) || dbUpdatedMs > localUpdatedMs)) {
-      userPlanMap.set(cleanUserId, dbRow.plan);
+      setBoundedMap(userPlanMap, cleanUserId, dbRow.plan);
     }
     if (
       typeof dbRow.bonusCredits === "number" &&
       (!userBonusCreditsMap.has(cleanUserId) || dbUpdatedMs > localUpdatedMs)
     ) {
-      userBonusCreditsMap.set(cleanUserId, Math.max(0, dbRow.bonusCredits));
+      setBoundedMap(userBonusCreditsMap, cleanUserId, Math.max(0, dbRow.bonusCredits));
     }
 
     if (
       dbRow.proExpiresAt &&
       (!userProExpiresAtMap.has(cleanUserId) || dbUpdatedMs > localUpdatedMs)
     ) {
-      userProExpiresAtMap.set(cleanUserId, dbRow.proExpiresAt);
+      setBoundedMap(userProExpiresAtMap, cleanUserId, dbRow.proExpiresAt);
     } else if (
       dbRow.plan === "free" &&
       (!userPlanMap.has(cleanUserId) || dbUpdatedMs > localUpdatedMs)
@@ -467,7 +535,7 @@ async function loadUserDailyState(
           ? Math.min(DAILY_FREE_CREDITS, Math.max(0, dbRow.dailyCredits))
           : Math.max(0, DAILY_FREE_CREDITS - Math.max(0, dbRow.usedCredits ?? 0));
       const dbUsed = Math.max(0, DAILY_FREE_CREDITS - dbDaily);
-      dailyUsageMap.set(usageKey, {
+      setBoundedMap(dailyUsageMap, usageKey, {
         userId: cleanUserId,
         dateWib,
         dailyCredits: dbDaily,
@@ -536,25 +604,57 @@ export async function getUserQuota(
   };
 }
 
+export interface PreflightUserQuotaState {
+  userId: string;
+  plan: QuotaPlanId;
+  dailyCredits: number;
+  usedToday: number;
+  bonusCredits: number;
+  dateWib: string;
+  expiresAt?: string;
+}
+
 /**
- * Checks whether `userId` has enough credits for `modelKey` and deducts atomically when allowed.
- * - `plan === "pro"` is always permitted without deducting `dailyCredits` or `bonusCredits`.
- * - Free users consume `dailyCredits` first, then take any remainder from permanent `bonusCredits`.
- * - Rejects with `QUOTA_EXCEEDED` when `dailyCredits + bonusCredits < cost`.
+ * Loads user's daily quota state without consuming credits yet.
+ * Useful to run in parallel with Turnstile & chat/history lookup before committing deduction.
  */
-export async function checkAndConsumeQuota(
+export async function prefetchUserQuotaState(
   userId: string,
+  now: Date = new Date()
+): Promise<PreflightUserQuotaState> {
+  const cleanUserId = (userId || "").trim() || "anonymous";
+  const loaded = await loadUserDailyState(cleanUserId, now);
+  return {
+    userId: cleanUserId,
+    ...loaded,
+  };
+}
+
+/**
+ * Synchronously validates and deducts credits using a prefetched quota state (0ms DB latency).
+ * Persists asynchronously to Supabase (`upsertSupabaseQuotaRow`) and debounced local fallback if needed.
+ */
+export function consumeQuotaFromPreflight(
+  preflight: PreflightUserQuotaState,
   modelKey: QuotaModelKey,
   now: Date = new Date()
-): Promise<QuotaCheckResult> {
-  const cleanUserId = (userId || "").trim() || "anonymous";
+): QuotaCheckResult {
+  const cleanUserId = preflight.userId;
   const cost = MODEL_CREDIT_COST[modelKey] ?? MODEL_CREDIT_COST.pro;
   const resetAt = getNextWibMidnightIso(now);
+  const { plan, dateWib } = preflight;
 
-  const { plan, dailyCredits, bonusCredits, dateWib } = await loadUserDailyState(
-    cleanUserId,
-    now
-  );
+  // Guard against concurrent requests updating in-memory balances while preflight was in flight
+  const usageKey = makeUsageKey(cleanUserId, dateWib);
+  const latestDailyRecord = dailyUsageMap.get(usageKey);
+  const dailyCredits = latestDailyRecord
+    ? Math.min(preflight.dailyCredits, Math.max(0, Math.min(DAILY_FREE_CREDITS, latestDailyRecord.dailyCredits)))
+    : preflight.dailyCredits;
+  const latestBonus = userBonusCreditsMap.get(cleanUserId);
+  const bonusCredits =
+    typeof latestBonus === "number"
+      ? Math.min(preflight.bonusCredits, Math.max(0, latestBonus))
+      : preflight.bonusCredits;
 
   if (plan === "pro") {
     return {
@@ -592,15 +692,14 @@ export async function checkAndConsumeQuota(
   const nextBonusCredits = Math.max(0, bonusCredits - consumeFromBonus);
   const nextRemaining = nextDailyCredits + nextBonusCredits;
 
-  const usageKey = makeUsageKey(cleanUserId, dateWib);
-  dailyUsageMap.set(usageKey, {
+  setBoundedMap(dailyUsageMap, usageKey, {
     userId: cleanUserId,
     dateWib,
     dailyCredits: nextDailyCredits,
     usedCredits: nextUsedToday,
     updatedAt: now.toISOString(),
   });
-  userBonusCreditsMap.set(cleanUserId, nextBonusCredits);
+  setBoundedMap(userBonusCreditsMap, cleanUserId, nextBonusCredits);
 
   persistLocalStoreSafe(now);
   void upsertSupabaseQuotaRow(
@@ -622,6 +721,21 @@ export async function checkAndConsumeQuota(
     required: cost,
     resetAt,
   };
+}
+
+/**
+ * Checks whether `userId` has enough credits for `modelKey` and deducts atomically when allowed.
+ * - `plan === "pro"` is always permitted without deducting `dailyCredits` or `bonusCredits`.
+ * - Free users consume `dailyCredits` first, then take any remainder from permanent `bonusCredits`.
+ * - Rejects with `QUOTA_EXCEEDED` when `dailyCredits + bonusCredits < cost`.
+ */
+export async function checkAndConsumeQuota(
+  userId: string,
+  modelKey: QuotaModelKey,
+  now: Date = new Date()
+): Promise<QuotaCheckResult> {
+  const preflight = await prefetchUserQuotaState(userId, now);
+  return consumeQuotaFromPreflight(preflight, modelKey, now);
 }
 
 export interface AdminQuotaUpdateInput {

@@ -1,7 +1,7 @@
 import dotenv from "dotenv";
 dotenv.config();
 
-import { randomUUID } from "crypto";
+import { randomUUID, createHash } from "crypto";
 import fs from "fs";
 import path from "path";
 import express, { Request, Response, NextFunction } from "express";
@@ -46,6 +46,9 @@ import {
   bindQuotaSupabaseClient,
   getUserQuota,
   checkAndConsumeQuota,
+  prefetchUserQuotaState,
+  consumeQuotaFromPreflight,
+  type PreflightUserQuotaState,
 } from "./services/quotaService";
 import { axiomaRateLimiter } from "./middleware/rateLimiter";
 import {
@@ -585,6 +588,28 @@ const CHAT_TITLE_MAX_LENGTH = 40;
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 
+const MAX_TRACKED_MAP_ENTRIES = 5_000;
+const AUTH_TOKEN_CACHE_TTL_MS = 60_000; // 60 seconds
+const AUTH_TOKEN_CACHE_MAX_ENTRIES = 1_000;
+const IN_MEMORY_CLEANUP_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+
+function setBoundedMapEntry<K, V>(
+  map: Map<K, V>,
+  key: K,
+  value: V,
+  maxEntries: number = MAX_TRACKED_MAP_ENTRIES
+): void {
+  if (map.has(key)) {
+    map.delete(key);
+  } else if (map.size >= maxEntries) {
+    const oldestKey = map.keys().next().value;
+    if (oldestKey !== undefined) {
+      map.delete(oldestKey);
+    }
+  }
+  map.set(key, value);
+}
+
 // Sliding-window rate limiters: enforced per User ID AND per Client IP (#3)
 const userRateWindowMap = new Map<string, number[]>();
 const ipRateWindowMap = new Map<string, number[]>();
@@ -606,14 +631,18 @@ function evaluateSlidingWindow(
       1,
       Math.ceil((oldestInWindow + windowMs - now) / 1000)
     );
-    store.set(key, timestamps);
+    setBoundedMapEntry(store, key, timestamps);
     return { allowed: false, retryAfterSec, remaining: 0 };
   }
 
   if (recordHit) {
     timestamps.push(now);
   }
-  store.set(key, timestamps);
+  if (timestamps.length === 0) {
+    store.delete(key);
+  } else {
+    setBoundedMapEntry(store, key, timestamps);
+  }
   return {
     allowed: true,
     retryAfterSec: 0,
@@ -672,7 +701,10 @@ async function verifyTurnstileUser(
     if (!checkError && cached?.verified_at) {
       const verifiedTime = new Date(cached.verified_at).getTime();
       if (!Number.isNaN(verifiedTime) && Date.now() - verifiedTime < TURNSTILE_CACHE_TTL_MS) {
-        inMemoryTurnstileCache.set(userId, { verified_at: verifiedTime, client_ip: clientIp });
+        setBoundedMapEntry(inMemoryTurnstileCache, userId, {
+          verified_at: verifiedTime,
+          client_ip: clientIp,
+        });
         return { success: true };
       }
     }
@@ -730,7 +762,10 @@ async function verifyTurnstileUser(
 
     // 5. Cache successful verification in memory AND in database (30 mins)
     const nowTime = Date.now();
-    inMemoryTurnstileCache.set(userId, { verified_at: nowTime, client_ip: clientIp });
+    setBoundedMapEntry(inMemoryTurnstileCache, userId, {
+      verified_at: nowTime,
+      client_ip: clientIp,
+    });
 
     void supabase
       .from("user_turnstile_verifications")
@@ -980,7 +1015,7 @@ const inMemoryFeedbackFallback = new Map<string, FeedbackEntry>();
 
 function recordChatOwner(chatId: string, userId: string): void {
   if (!chatId || !userId || dbHasChatsUserIdColumn === true) return;
-  chatOwnerMap.set(chatId, userId);
+  setBoundedMapEntry(chatOwnerMap, chatId, userId);
 }
 
 function removeChatOwner(chatId: string): void {
@@ -989,11 +1024,12 @@ function removeChatOwner(chatId: string): void {
 
 function recordMessageAgent(messageId: string, agentId: string, agentName: string): void {
   if (!messageId || !agentId || dbHasMessagesAgentColumns === true) return;
-  messageAgentMap.set(messageId, { agent_id: agentId, agent_name: agentName });
+  setBoundedMapEntry(messageAgentMap, messageId, { agent_id: agentId, agent_name: agentName });
 }
 
 // Auto-detected schema flags so backend works both before and after SQL migrations (#1, #3, #15)
 let dbHasChatsUserIdColumn: boolean | null = null;
+let dbHasChatsUpdatedAtColumn: boolean | null = null;
 let dbHasMessagesAgentColumns: boolean | null = null;
 
 function isMissingColumnError(err: any): boolean {
@@ -1007,12 +1043,26 @@ function isMissingColumnError(err: any): boolean {
   );
 }
 
+function touchChatUpdatedAt(chatId: string): void {
+  if (!chatId || dbHasChatsUpdatedAtColumn === false) return;
+  void supabase
+    .from("chats")
+    .update({ updated_at: new Date().toISOString() })
+    .eq("id", chatId)
+    .then(({ error }) => {
+      if (error && isMissingColumnError(error)) {
+        dbHasChatsUpdatedAtColumn = false;
+      }
+    });
+}
+
 // Probe DB columns & restore today's Gemini quota count from Supabase on startup (#1, #3, #9)
 async function probeDatabaseSchema(): Promise<void> {
   try {
     const today = getCurrentUtcDateKey();
-    const [chatsProbe, msgsProbe, usageProbe] = await Promise.all([
+    const [chatsProbe, chatsUpdatedAtProbe, msgsProbe, usageProbe] = await Promise.all([
       supabase.from("chats").select("id, user_id").limit(1),
+      supabase.from("chats").select("id, updated_at").limit(1),
       supabase.from("messages").select("id, agent_id, agent_name").limit(1),
       supabase
         .from("gemini_daily_usage")
@@ -1021,6 +1071,8 @@ async function probeDatabaseSchema(): Promise<void> {
         .maybeSingle(),
     ]);
     dbHasChatsUserIdColumn = !chatsProbe.error || !isMissingColumnError(chatsProbe.error);
+    dbHasChatsUpdatedAtColumn =
+      !chatsUpdatedAtProbe.error || !isMissingColumnError(chatsUpdatedAtProbe.error);
     dbHasMessagesAgentColumns = !msgsProbe.error || !isMissingColumnError(msgsProbe.error);
     if (!usageProbe.error && usageProbe.data && typeof usageProbe.data.call_count === "number") {
       dailyGeminiUsage = {
@@ -1029,7 +1081,7 @@ async function probeDatabaseSchema(): Promise<void> {
       };
     }
     console.log(
-      `[Schema Probe] chats.user_id=${dbHasChatsUserIdColumn}, messages.agent_id=${dbHasMessagesAgentColumns}, gemini_daily_usage=${dailyGeminiUsage.count}`
+      `[Schema Probe] chats.user_id=${dbHasChatsUserIdColumn}, chats.updated_at=${dbHasChatsUpdatedAtColumn}, messages.agent_id=${dbHasMessagesAgentColumns}, gemini_daily_usage=${dailyGeminiUsage.count}`
     );
   } catch {
     // Will auto-detect on first query if startup probe fails
@@ -1179,10 +1231,96 @@ export function makeChatTitle(text: string): string {
 }
 
 
+// Short-TTL verified JWT auth cache keyed ONLY by SHA-256 hash of bearer token (never raw token)
+const authTokenCache = new Map<string, { user: ResolvedUser; expiresAt: number }>();
+
+function hashAuthToken(rawToken: string): string {
+  return createHash("sha256").update(rawToken).digest("hex");
+}
+
+function extractJwtExpiryMs(rawToken: string): number | null {
+  try {
+    const parts = rawToken.split(".");
+    if (parts.length !== 3) return null;
+    const payloadJson = Buffer.from(parts[1], "base64url").toString("utf8");
+    const parsed = JSON.parse(payloadJson) as { exp?: unknown };
+    if (typeof parsed.exp === "number" && Number.isFinite(parsed.exp)) {
+      return parsed.exp * 1000;
+    }
+  } catch {
+    // Ignore malformed JWT payloads
+  }
+  return null;
+}
+
+function sweepRateWindowMap(map: Map<string, number[]>, windowMs: number, now: number): void {
+  const windowStart = now - windowMs;
+  for (const [key, timestamps] of map.entries()) {
+    const active = timestamps.filter((ts) => ts > windowStart);
+    if (active.length === 0) {
+      map.delete(key);
+    } else if (active.length !== timestamps.length) {
+      map.set(key, active);
+    }
+  }
+  while (map.size > MAX_TRACKED_MAP_ENTRIES) {
+    const oldestKey = map.keys().next().value;
+    if (oldestKey === undefined) break;
+    map.delete(oldestKey);
+  }
+}
+
+function cleanupInMemoryCaches(): void {
+  const now = Date.now();
+  sweepRateWindowMap(userRateWindowMap, RATE_LIMIT_WINDOW_MS, now);
+  sweepRateWindowMap(ipRateWindowMap, RATE_LIMIT_WINDOW_MS, now);
+  sweepRateWindowMap(uploadIpRateWindowMap, RATE_LIMIT_UPLOAD_WINDOW_MS, now);
+  sweepRateWindowMap(uploadUserRateWindowMap, RATE_LIMIT_UPLOAD_WINDOW_MS, now);
+
+  for (const [key, entry] of inMemoryTurnstileCache.entries()) {
+    if (now - entry.verified_at >= TURNSTILE_CACHE_TTL_MS) {
+      inMemoryTurnstileCache.delete(key);
+    }
+  }
+  while (inMemoryTurnstileCache.size > MAX_TRACKED_MAP_ENTRIES) {
+    const oldestKey = inMemoryTurnstileCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    inMemoryTurnstileCache.delete(oldestKey);
+  }
+
+  for (const [key, entry] of authTokenCache.entries()) {
+    if (entry.expiresAt <= now) {
+      authTokenCache.delete(key);
+    }
+  }
+  while (authTokenCache.size > AUTH_TOKEN_CACHE_MAX_ENTRIES) {
+    const oldestKey = authTokenCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    authTokenCache.delete(oldestKey);
+  }
+
+  for (const fallbackMap of [chatOwnerMap, messageAgentMap, inMemoryFeedbackFallback] as Array<
+    Map<string, unknown>
+  >) {
+    while (fallbackMap.size > MAX_TRACKED_MAP_ENTRIES) {
+      const oldestKey = fallbackMap.keys().next().value;
+      if (oldestKey === undefined) break;
+      fallbackMap.delete(oldestKey);
+    }
+  }
+}
+
+const inMemoryCacheCleanupTimer = setInterval(() => {
+  cleanupInMemoryCaches();
+}, IN_MEMORY_CLEANUP_INTERVAL_MS);
+if (typeof inMemoryCacheCleanupTimer.unref === "function") {
+  inMemoryCacheCleanupTimer.unref();
+}
+
 /**
  * Resolves the calling user:
  * - Checks for `x-guest-mode: true` -> returns guest user immediately.
- * - If `Authorization: Bearer <jwt>` is provided and valid, verifies via Supabase Auth.
+ * - If `Authorization: Bearer <jwt>` is provided and valid, verifies via short-TTL SHA-256 cache or Supabase Auth.
  * - In Guest Mode (no valid JWT), assigns a guest identity and permits access to Gemini AI chat without 401 error.
  */
 async function resolveRequestUser(
@@ -1205,6 +1343,16 @@ async function resolveRequestUser(
   );
 
   if (!isExplicitGuest && hasValidToken) {
+    const tokenHash = hashAuthToken(rawToken);
+    const now = Date.now();
+    const cachedAuth = authTokenCache.get(tokenHash);
+    if (cachedAuth && cachedAuth.expiresAt > now) {
+      return { user: cachedAuth.user };
+    }
+    if (cachedAuth) {
+      authTokenCache.delete(tokenHash);
+    }
+
     try {
       const { data, error } = await supabase.auth.getUser(rawToken);
       if (!error && data?.user) {
@@ -1215,14 +1363,26 @@ async function resolveRequestUser(
           (typeof meta.name === "string" && meta.name.trim()) ||
           (email ? email.split("@")[0] : "") ||
           "Pengguna";
-        return {
-          user: {
-            id: data.user.id,
-            authenticated: true,
-            email,
-            name,
-          },
+        const resolvedUser: ResolvedUser = {
+          id: data.user.id,
+          authenticated: true,
+          email,
+          name,
         };
+        const jwtExpMs = extractJwtExpiryMs(rawToken);
+        const cacheExpiresAt =
+          jwtExpMs !== null
+            ? Math.min(now + AUTH_TOKEN_CACHE_TTL_MS, jwtExpMs)
+            : now + AUTH_TOKEN_CACHE_TTL_MS;
+        if (cacheExpiresAt > now) {
+          setBoundedMapEntry(
+            authTokenCache,
+            tokenHash,
+            { user: resolvedUser, expiresAt: cacheExpiresAt },
+            AUTH_TOKEN_CACHE_MAX_ENTRIES
+          );
+        }
+        return { user: resolvedUser };
       }
       log.warn(`AUTH token validation failed: ${error?.message || "no user"}. Falling back to guest mode.`);
     } catch (err: any) {
@@ -2028,10 +2188,68 @@ app.get("/api/chats", async (req: Request, res: Response) => {
       });
     }
 
-    const { data: allChats, error: chatsError } = await supabase
-      .from("chats")
-      .select("*")
-      .order("created_at", { ascending: false });
+    const CHATS_LIST_LIMIT = 50;
+    let ownedChats: Record<string, any>[] = [];
+    let chatsError: any = null;
+
+    if (dbHasChatsUserIdColumn !== false) {
+      const useUpdatedAt = dbHasChatsUpdatedAtColumn !== false;
+      const selectCols = useUpdatedAt
+        ? "id, title, created_at, updated_at, user_id"
+        : "id, title, created_at, user_id";
+      const orderCol = useUpdatedAt ? "updated_at" : "created_at";
+
+      const primaryRes = await supabase
+        .from("chats")
+        .select(selectCols)
+        .eq("user_id", user.id)
+        .order(orderCol, { ascending: false })
+        .limit(CHATS_LIST_LIMIT);
+
+      if (!primaryRes.error) {
+        dbHasChatsUserIdColumn = true;
+        if (useUpdatedAt) dbHasChatsUpdatedAtColumn = true;
+        ownedChats = (primaryRes.data || []) as Record<string, any>[];
+      } else if (isMissingColumnError(primaryRes.error)) {
+        // Retry without optional updated_at column if absent in DB
+        if (useUpdatedAt && String(primaryRes.error.message || "").toLowerCase().includes("updated_at")) {
+          dbHasChatsUpdatedAtColumn = false;
+          const retryNoUpdated = await supabase
+            .from("chats")
+            .select("id, title, created_at, user_id")
+            .eq("user_id", user.id)
+            .order("created_at", { ascending: false })
+            .limit(CHATS_LIST_LIMIT);
+          if (!retryNoUpdated.error) {
+            dbHasChatsUserIdColumn = true;
+            ownedChats = (retryNoUpdated.data || []) as Record<string, any>[];
+          } else if (isMissingColumnError(retryNoUpdated.error)) {
+            dbHasChatsUserIdColumn = false;
+          } else {
+            chatsError = retryNoUpdated.error;
+          }
+        } else {
+          dbHasChatsUserIdColumn = false;
+        }
+      } else {
+        chatsError = primaryRes.error;
+      }
+    }
+
+    if (dbHasChatsUserIdColumn === false && !chatsError) {
+      const fallbackRes = await supabase
+        .from("chats")
+        .select("id, title, created_at")
+        .order("created_at", { ascending: false })
+        .limit(200);
+      if (fallbackRes.error) {
+        chatsError = fallbackRes.error;
+      } else {
+        ownedChats = ((fallbackRes.data || []) as Record<string, any>[])
+          .filter((row) => getEffectiveChatOwner(String(row.id), row) === user.id)
+          .slice(0, CHATS_LIST_LIMIT);
+      }
+    }
 
     if (chatsError) {
       log.error("GET /api/chats select error", chatsError);
@@ -2042,10 +2260,6 @@ app.get("/api/chats", async (req: Request, res: Response) => {
       });
     }
 
-    const ownedChats = (allChats || []).filter(
-      (row: Record<string, any>) => getEffectiveChatOwner(String(row.id), row) === user.id
-    );
-
     if (ownedChats.length === 0) {
       return res.status(200).json({
         success: true,
@@ -2053,6 +2267,7 @@ app.get("/api/chats", async (req: Request, res: Response) => {
       });
     }
 
+    // Bounded to at most 50 owned chat IDs from SQL filter above
     const ownedIds = ownedChats.map((c: Record<string, any>) => String(c.id));
     const { data: msgTimes } = await supabase
       .from("messages")
@@ -2072,16 +2287,22 @@ app.get("/api/chats", async (req: Request, res: Response) => {
       latestByChat.has(String(chat.id))
     );
 
-    const result = validChats.map((chat: Record<string, any>) => {
-      const id = String(chat.id);
-      return {
-        id,
-        title: chat.title || DEFAULT_CHAT_TITLE,
-        created_at: chat.created_at,
-        updated_at: chat.updated_at,
-        last_activity_at: latestByChat.get(id) || chat.updated_at || chat.created_at,
-      };
-    });
+    const result = validChats
+      .map((chat: Record<string, any>) => {
+        const id = String(chat.id);
+        return {
+          id,
+          title: chat.title || DEFAULT_CHAT_TITLE,
+          created_at: chat.created_at,
+          updated_at: chat.updated_at,
+          last_activity_at: latestByChat.get(id) || chat.updated_at || chat.created_at,
+        };
+      })
+      .sort(
+        (a, b) =>
+          Date.parse(String(b.last_activity_at || b.created_at || 0)) -
+          Date.parse(String(a.last_activity_at || a.created_at || 0))
+      );
 
     return res.status(200).json({
       success: true,
@@ -2128,11 +2349,43 @@ app.get("/api/chats/:id/messages", async (req: Request<{ id: string }>, res: Res
       });
     }
 
-    const { data: existingChat, error: chatError } = await supabase
-      .from("chats")
-      .select("*")
-      .eq("id", chatId)
-      .maybeSingle();
+    const MESSAGES_PAGE_LIMIT = 100;
+    const chatSelectCols =
+      dbHasChatsUserIdColumn === false ? "id, title, created_at" : "id, title, created_at, user_id";
+    const msgSelectCols =
+      dbHasMessagesAgentColumns === false
+        ? "id, chat_id, role, content, created_at"
+        : "id, chat_id, role, content, created_at, agent_id, agent_name";
+
+    // Run chat lookup, latest 100 messages, and attachments query in parallel
+    const [chatRes, msgRes, attRes] = await Promise.all([
+      supabase.from("chats").select(chatSelectCols).eq("id", chatId).maybeSingle(),
+      supabase
+        .from("messages")
+        .select(msgSelectCols)
+        .eq("chat_id", chatId)
+        .order("created_at", { ascending: false })
+        .limit(MESSAGES_PAGE_LIMIT),
+      supabase
+        .from("message_attachments")
+        .select(
+          "id, message_id, storage_path, original_name, mime_type, size_bytes, width, height, page_count"
+        )
+        .eq("chat_id", chatId),
+    ]);
+
+    let existingChat: Record<string, any> | null = (chatRes.data as Record<string, any> | null) || null;
+    let chatError = chatRes.error;
+    if (chatError && isMissingColumnError(chatError)) {
+      dbHasChatsUserIdColumn = false;
+      const retryChat = await supabase
+        .from("chats")
+        .select("id, title, created_at")
+        .eq("id", chatId)
+        .maybeSingle();
+      existingChat = (retryChat.data as Record<string, any> | null) || null;
+      chatError = retryChat.error;
+    }
 
     if (chatError) {
       log.error("GET /api/chats/:id/messages chat error", chatError);
@@ -2161,11 +2414,19 @@ app.get("/api/chats/:id/messages", async (req: Request<{ id: string }>, res: Res
       });
     }
 
-    const { data: rows, error: msgError } = await supabase
-      .from("messages")
-      .select("*")
-      .eq("chat_id", chatId)
-      .order("created_at", { ascending: true });
+    let rawMsgRows: Record<string, any>[] = (msgRes.data || []) as Record<string, any>[];
+    let msgError = msgRes.error;
+    if (msgError && isMissingColumnError(msgError)) {
+      dbHasMessagesAgentColumns = false;
+      const retryMsgs = await supabase
+        .from("messages")
+        .select("id, chat_id, role, content, created_at")
+        .eq("chat_id", chatId)
+        .order("created_at", { ascending: false })
+        .limit(MESSAGES_PAGE_LIMIT);
+      rawMsgRows = (retryMsgs.data || []) as Record<string, any>[];
+      msgError = retryMsgs.error;
+    }
 
     if (msgError) {
       log.error("GET /api/chats/:id/messages query error", msgError);
@@ -2176,22 +2437,49 @@ app.get("/api/chats/:id/messages", async (req: Request<{ id: string }>, res: Res
       });
     }
 
-    // Query attachments for this chat to enrich message objects with signed URLs (#6, #11)
-    const { data: attachmentRows } = await supabase
-      .from("message_attachments")
-      .select("*")
-      .eq("chat_id", chatId);
+    // Reverse descending latest-100 rows back into ascending chronological order
+    const rows = [...rawMsgRows].reverse();
+
+    let attachmentRows: Record<string, any>[] = (attRes.data || []) as Record<string, any>[];
+    if (attRes.error && isMissingColumnError(attRes.error)) {
+      const retryAtts = await supabase
+        .from("message_attachments")
+        .select("id, message_id, storage_path, original_name, mime_type, size_bytes, width, height")
+        .eq("chat_id", chatId);
+      attachmentRows = (retryAtts.data || []) as Record<string, any>[];
+    }
+
+    // Batch generate all signed URLs in 1 single Supabase Storage RPC call
+    const linkedAttachments = attachmentRows.filter(
+      (att) => Boolean(att.message_id) && typeof att.storage_path === "string" && att.storage_path
+    );
+    const signedUrlByPath = new Map<string, string>();
+    if (linkedAttachments.length > 0) {
+      const uniquePaths = Array.from(
+        new Set(linkedAttachments.map((att) => String(att.storage_path)))
+      );
+      const { data: batchSigned } = await supabase.storage
+        .from("attachments")
+        .createSignedUrls(uniquePaths, SIGNED_URL_TTL_SECONDS);
+
+      for (const item of batchSigned || []) {
+        if (item?.path && item?.signedUrl) {
+          signedUrlByPath.set(item.path, item.signedUrl);
+        }
+      }
+    }
 
     const attachmentsByMessage = new Map<string, any[]>();
-    for (const att of attachmentRows || []) {
-      if (!att.message_id) continue;
-      const list = attachmentsByMessage.get(String(att.message_id)) || [];
-      const isPdf = att.mime_type === "application/pdf";
-      const { data: signedData } = await supabase.storage
-        .from("attachments")
-        .createSignedUrl(att.storage_path, SIGNED_URL_TTL_SECONDS, {
-          download: isPdf ? sanitizeFilename(att.original_name) : undefined,
-        });
+    for (const att of linkedAttachments) {
+      const msgKey = String(att.message_id);
+      const list = attachmentsByMessage.get(msgKey) || [];
+      let signedUrl: string | null = signedUrlByPath.get(String(att.storage_path)) || null;
+      if (signedUrl && att.mime_type === "application/pdf" && att.original_name) {
+        const sep = signedUrl.includes("?") ? "&" : "?";
+        signedUrl = `${signedUrl}${sep}download=${encodeURIComponent(
+          sanitizeFilename(String(att.original_name))
+        )}`;
+      }
 
       list.push({
         id: att.id,
@@ -2200,13 +2488,13 @@ app.get("/api/chats/:id/messages", async (req: Request<{ id: string }>, res: Res
         size_bytes: att.size_bytes,
         width: att.width,
         height: att.height,
-        page_count: att.page_count,
-        signed_url: signedData?.signedUrl || null,
+        page_count: att.page_count ?? null,
+        signed_url: signedUrl,
       });
-      attachmentsByMessage.set(String(att.message_id), list);
+      attachmentsByMessage.set(msgKey, list);
     }
 
-    const enrichedMessages = (rows || []).map((row: Record<string, any>) => {
+    const enrichedMessages = rows.map((row: Record<string, any>) => {
       const msgId = String(row.id);
       const fallbackAgent = messageAgentMap.get(msgId);
       const rawAgentId =
@@ -4557,24 +4845,11 @@ app.post(
         });
       }
 
-      // 2b. Cloudflare Turnstile anti-bot verification (#9)
+      // 2b. Extract Cloudflare Turnstile token (verified in parallel with quota & chat history below) (#9)
       const turnstileToken =
         (req.body?.turnstile_token as string) ||
         (req.headers["x-turnstile-token"] as string) ||
         (req.headers["cf-turnstile-token"] as string);
-      const turnstileStatus = await verifyTurnstileUser(
-        user.id,
-        clientIp,
-        turnstileToken
-      );
-      if (!turnstileStatus.success) {
-        const statusCode = turnstileStatus.code === "turnstile_network_error" ? 503 : 403;
-        return sendJson(statusCode, {
-          success: false,
-          code: turnstileStatus.code || "turnstile_failed",
-          error: turnstileStatus.error || "Verifikasi keamanan Turnstile gagal.",
-        });
-      }
 
       const {
         chat_id,
@@ -4709,40 +4984,6 @@ app.post(
       const isGuestMode = req.headers["x-guest-mode"] === "true" || !user.authenticated;
       const userContent = content.trim();
 
-      // 3b. Enforce Per-User Daily Credit Quota before DB/AI execution (authenticated users)
-      let userRemainingCredits: number | undefined;
-      if (!isGuestMode && user.authenticated) {
-        const preExplicitMediaMode = (req.body as any)?.media_mode;
-        const preMediaIntent =
-          preExplicitMediaMode === "image" || preExplicitMediaMode === "video"
-            ? ({ type: preExplicitMediaMode } as const)
-            : detectDirectMediaIntent(userContent, rawAttachmentIds.length > 0);
-        const quotaModelKey = resolveQuotaModelKey({
-          agentId: agentProfile.id,
-          engineMode: (req.body as any)?.engine_mode,
-          isMedia: Boolean(preMediaIntent && userContent),
-        });
-        const quotaCheck = await checkAndConsumeQuota(user.id, quotaModelKey);
-        res.setHeader("X-Axioma-Remaining-Credits", String(quotaCheck.remaining));
-        if (!quotaCheck.allowed) {
-          stopHeartbeat();
-          res.setHeader("Content-Type", "application/json; charset=utf-8");
-          return res.status(429).json({
-            success: false,
-            code: "QUOTA_EXCEEDED",
-            message: "Kuota kredit harian Anda tidak mencukupi untuk model ini.",
-            error: "Kuota kredit harian Anda tidak mencukupi untuk model ini.",
-            remaining: quotaCheck.remaining,
-            dailyCredits: quotaCheck.dailyCredits,
-            bonusCredits: quotaCheck.bonusCredits,
-            required: quotaCheck.required,
-            resetAt: quotaCheck.resetAt,
-            suggestedModel: "omni",
-          });
-        }
-        userRemainingCredits = quotaCheck.remaining;
-      }
-
       let existingChat: any = null;
       let chatTitle = DEFAULT_CHAT_TITLE;
       let needsTitleUpdate = false;
@@ -4752,43 +4993,84 @@ app.post(
         content: string;
         created_at: string;
       }> = [];
+      let userRemainingCredits: number | undefined;
+
+      // Run Turnstile verification, quota prefetch, chat ownership lookup, and latest 24-message history in parallel
+      log.info("STEP1 parallel preflight: Turnstile + quota + chat + recent history");
+      const tDbVerifyStart = Date.now();
+      const chatSelectCols =
+        dbHasChatsUserIdColumn === false
+          ? "id, title, created_at"
+          : "id, title, created_at, user_id";
+
+      const [turnstileStatus, preflightQuota, chatResult, historyResult] = await Promise.all([
+        verifyTurnstileUser(user.id, clientIp, turnstileToken),
+        !isGuestMode && user.authenticated
+          ? prefetchUserQuotaState(user.id)
+          : Promise.resolve<PreflightUserQuotaState | null>(null),
+        !isGuestMode
+          ? supabase
+              .from("chats")
+              .select(chatSelectCols)
+              .eq("id", trimmedChatId)
+              .abortSignal(signal)
+              .maybeSingle()
+          : Promise.resolve({ data: null, error: null }),
+        !isGuestMode
+          ? supabase
+              .from("messages")
+              .select("id, role, content, created_at")
+              .eq("chat_id", trimmedChatId)
+              .order("created_at", { ascending: false })
+              .limit(24)
+              .abortSignal(signal)
+          : Promise.resolve({ data: null, error: null }),
+      ]);
+      stageTimings.db_verify_and_history_ms = Date.now() - tDbVerifyStart;
+
+      if (!turnstileStatus.success) {
+        const statusCode = turnstileStatus.code === "turnstile_network_error" ? 503 : 403;
+        return sendJson(statusCode, {
+          success: false,
+          code: turnstileStatus.code || "turnstile_failed",
+          error: turnstileStatus.error || "Verifikasi keamanan Turnstile gagal.",
+        });
+      }
 
       if (!isGuestMode) {
-        // Step 1: Verify chat existence & ownership + fetch chat history in parallel (#7)
-        log.info("STEP1 verify chat & load history in Supabase");
-        const tDbVerifyStart = Date.now();
-        const [chatResult, historyResult] = await Promise.all([
-          supabase
+        let resolvedChatData = chatResult.data as Record<string, any> | null;
+        let resolvedChatError = chatResult.error;
+        if (resolvedChatError && isMissingColumnError(resolvedChatError)) {
+          dbHasChatsUserIdColumn = false;
+          const retryChat = await supabase
             .from("chats")
-            .select("*")
+            .select("id, title, created_at")
             .eq("id", trimmedChatId)
             .abortSignal(signal)
-            .maybeSingle(),
-          supabase
-            .from("messages")
-            .select("id, role, content, created_at")
-            .eq("chat_id", trimmedChatId)
-            .order("created_at", { ascending: true })
-            .abortSignal(signal),
-        ]);
-        stageTimings.db_verify_and_history_ms = Date.now() - tDbVerifyStart;
+            .maybeSingle();
+          resolvedChatData = retryChat.data as Record<string, any> | null;
+          resolvedChatError = retryChat.error;
+        }
 
-        if (chatResult.error) {
-          log.error("STEP1 Supabase chat select error", chatResult.error);
+        if (resolvedChatError) {
+          log.error("STEP1 Supabase chat select error", resolvedChatError);
           return sendJson(500, {
             success: false,
             code: "database_error",
-            error: `Gagal memeriksa data percakapan: ${chatResult.error.message}`,
+            error: `Gagal memeriksa data percakapan: ${resolvedChatError.message}`,
           });
         }
 
-        existingChat = chatResult.data;
-        historyRows = (historyResult.data || []) as Array<{
-          id: string;
-          role: string;
-          content: string;
-          created_at: string;
-        }>;
+        existingChat = resolvedChatData;
+        // Reverse descending latest-24 rows back into ascending chronological order
+        historyRows = [
+          ...((historyResult.data || []) as Array<{
+            id: string;
+            role: string;
+            content: string;
+            created_at: string;
+          }>),
+        ].reverse();
 
         const ownership = verifyChatOwnership(trimmedChatId, existingChat, user);
         if (!ownership.allowed) {
@@ -4798,6 +5080,39 @@ app.post(
             code: "forbidden",
             error: ownership.reason || "Akses ditolak.",
           });
+        }
+
+        // 3b. Commit per-user daily credit deduction synchronously from prefetched state (only after Turnstile & ownership pass)
+        if (user.authenticated && preflightQuota) {
+          const preExplicitMediaMode = (req.body as any)?.media_mode;
+          const preMediaIntent =
+            preExplicitMediaMode === "image" || preExplicitMediaMode === "video"
+              ? ({ type: preExplicitMediaMode } as const)
+              : detectDirectMediaIntent(userContent, rawAttachmentIds.length > 0);
+          const quotaModelKey = resolveQuotaModelKey({
+            agentId: agentProfile.id,
+            engineMode: (req.body as any)?.engine_mode,
+            isMedia: Boolean(preMediaIntent && userContent),
+          });
+          const quotaCheck = consumeQuotaFromPreflight(preflightQuota, quotaModelKey);
+          res.setHeader("X-Axioma-Remaining-Credits", String(quotaCheck.remaining));
+          if (!quotaCheck.allowed) {
+            stopHeartbeat();
+            res.setHeader("Content-Type", "application/json; charset=utf-8");
+            return res.status(429).json({
+              success: false,
+              code: "QUOTA_EXCEEDED",
+              message: "Kuota kredit harian Anda tidak mencukupi untuk model ini.",
+              error: "Kuota kredit harian Anda tidak mencukupi untuk model ini.",
+              remaining: quotaCheck.remaining,
+              dailyCredits: quotaCheck.dailyCredits,
+              bonusCredits: quotaCheck.bonusCredits,
+              required: quotaCheck.required,
+              resetAt: quotaCheck.resetAt,
+              suggestedModel: "omni",
+            });
+          }
+          userRemainingCredits = quotaCheck.remaining;
         }
 
         chatTitle = existingChat?.title || DEFAULT_CHAT_TITLE;
@@ -4983,7 +5298,7 @@ app.post(
       if (effectiveAttachmentIds.length > 0) {
         const { data: attachmentRows, error: attSelectError } = await supabase
           .from("message_attachments")
-          .select("*")
+          .select("id, storage_path, original_name, mime_type, size_bytes")
           .in("id", effectiveAttachmentIds)
           .eq("user_id", user.id);
 
@@ -4999,23 +5314,25 @@ app.post(
             });
           }
 
-          for (const att of attachmentRows) {
-            const { data: blob, error: downloadError } = await supabase.storage
-              .from("attachments")
-              .download(att.storage_path);
+          // Download attachments in parallel via Promise.all
+          latestAttachmentParts = await Promise.all(
+            attachmentRows.map(async (att) => {
+              const { data: blob, error: downloadError } = await supabase.storage
+                .from("attachments")
+                .download(att.storage_path);
 
-            if (downloadError || !blob) {
-              log.error(`Failed to download attachment ${att.id}:`, downloadError);
-              throw new Error(`Gagal mengunduh lampiran "${att.original_name}" dari penyimpanan.`);
-            }
+              if (downloadError || !blob) {
+                log.error(`Failed to download attachment ${att.id}:`, downloadError);
+                throw new Error(`Gagal mengunduh lampiran "${att.original_name}" dari penyimpanan.`);
+              }
 
-            const arrayBuffer = await blob.arrayBuffer();
-            const base64Data = Buffer.from(arrayBuffer).toString("base64");
-            latestAttachmentParts.push({
-              mimeType: att.mime_type,
-              data: base64Data,
-            });
-          }
+              const arrayBuffer = await blob.arrayBuffer();
+              return {
+                mimeType: att.mime_type,
+                data: Buffer.from(arrayBuffer).toString("base64"),
+              };
+            })
+          );
         }
       }
 
@@ -5392,6 +5709,7 @@ app.post(
           });
         }
         finalAiMessageId = insertedMessageId || preGeneratedAiMsgId;
+        touchChatUpdatedAt(trimmedChatId);
       } else {
         stageTimings.total_ms = Date.now() - reqStartMs;
       }

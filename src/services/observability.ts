@@ -35,6 +35,30 @@ function getUtcDateKey(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
+let logsDirReady = false;
+
+function appendMetricLogNonBlocking(line: string): void {
+  // In production (e.g. Render ephemeral container), avoid disk I/O altogether
+  if (process.env.NODE_ENV === "production") {
+    return;
+  }
+
+  const logsDir = path.join(process.cwd(), "logs");
+  const filePath = path.join(logsDir, "metrics.jsonl");
+  const writePromise = logsDirReady
+    ? fs.promises.appendFile(filePath, line, "utf8")
+    : fs.promises
+        .mkdir(logsDir, { recursive: true })
+        .then(() => {
+          logsDirReady = true;
+          return fs.promises.appendFile(filePath, line, "utf8");
+        });
+
+  void writePromise.catch(() => {
+    // Never crash request flow if filesystem is read-only
+  });
+}
+
 let dailyState: DailyMetricsState = {
   date: getUtcDateKey(),
   totalRequests: 0,
@@ -137,17 +161,7 @@ export function recordFeatureMetric(input: FeatureMetricInput): void {
     error: Boolean(input.error),
   };
 
-  try {
-    const logsDir = path.join(process.cwd(), "logs");
-    fs.mkdirSync(logsDir, { recursive: true });
-    fs.appendFileSync(
-      path.join(logsDir, "metrics.jsonl"),
-      `${JSON.stringify(logRecord)}\n`,
-      "utf8"
-    );
-  } catch {
-    // Never crash request flow if filesystem is read-only
-  }
+  appendMetricLogNonBlocking(`${JSON.stringify(logRecord)}\n`);
 }
 
 export function getMetricsSummary(): {
